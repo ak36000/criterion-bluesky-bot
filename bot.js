@@ -59,12 +59,35 @@ if (moreHref) {
   console.log(`Image URL: ${imageUrl}`);
 }
 
-// --- Post to Bluesky ---
+// --- Post to Bluesky with retries ---
 const agent = new AtpAgent({ service: 'https://bsky.social' });
-await agent.login({
-  identifier: process.env.BSKY_HANDLE,
-  password: process.env.BSKY_APP_PASSWORD,
-});
+
+async function postToBlueski() {
+  await agent.login({
+    identifier: process.env.BSKY_HANDLE,
+    password: process.env.BSKY_APP_PASSWORD,
+  });
+
+  // ... (keep all your existing image upload and facets code here) ...
+
+  await agent.post({ text: postText, facets, embed, createdAt: new Date().toISOString() });
+}
+
+// Retry up to 3 times with a 10-second delay between attempts
+let lastError;
+for (let attempt = 1; attempt <= 3; attempt++) {
+  try {
+    await postToBlueski();
+    console.log(`Posted: ${title}`);
+    lastError = null;
+    break;
+  } catch (e) {
+    lastError = e;
+    console.warn(`Attempt ${attempt} failed: ${e.message}`);
+    if (attempt < 3) await new Promise(r => setTimeout(r, 10_000));
+  }
+}
+if (lastError) throw lastError;
 
 // Build post text
 const filmLink = moreHref ?? 'https://www.criterionchannel.com/events/criterion-24-7';
