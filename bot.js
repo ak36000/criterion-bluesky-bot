@@ -17,8 +17,14 @@ const nowHtml = await nowRes.text();
 const $ = cheerio.load(nowHtml);
 
 // The page lists "What's on now: TITLE" and a More link
-const nowText = $('a[href*="criterion-24-7"]').first().text().trim();
-const title = nowText.replace(/^What's on now:\s*/i, '').trim();
+const nowText = $('a').filter((_, el) => /what'?s on now/i.test($(el).text())).first().text().trim();
+let title = nowText.replace(/^What'?s on now:\s*/i, '').trim();
+
+// Fallback: derive title from the More link URL slug
+if (!title && moreHref) {
+  const slug = moreHref.replace(/.*criterionchannel\.com\//, '');
+  title = slug.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+}
 
 const moreHref = $('a').filter((_, el) => $(el).text().trim() === 'More').first().attr('href');
 const nextText = $('body').text().match(/Next film starts in:\s*(.+)/i)?.[1]?.trim() ?? 'unknown';
