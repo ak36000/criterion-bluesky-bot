@@ -34,6 +34,9 @@ jobs:
         run: |
           git config user.name "criterion-bot"
           git config user.email "bot@users.noreply.github.com"
+          if [ ! -f state.json ]; then
+            echo '{}' > state.json
+          fi
           git add state.json
           if ! git diff --staged --quiet; then
             git commit -m "update state"
