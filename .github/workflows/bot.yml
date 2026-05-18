@@ -2,7 +2,7 @@ name: Criterion Bot
 
 on:
   schedule:
-    - cron: '*/5 * * * *'   # every 5 minutes
+    - cron: '*/5 * * * *'   # every 5 minutes, at least theoretically
   workflow_dispatch:          # lets you trigger it manually too
 
 env:
