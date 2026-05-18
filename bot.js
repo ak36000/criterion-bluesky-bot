@@ -2,6 +2,7 @@ import fetch from 'node-fetch';
 import * as cheerio from 'cheerio';
 import { AtpAgent, BlobRef } from '@atproto/api';
 import fs from 'fs';
+import { Agent } from 'node:http';
 
 const STATE_FILE = 'state.json';
 
@@ -60,9 +61,16 @@ if (moreHref) {
 }
 
 // --- Post to Bluesky with retries ---
-const agent = new AtpAgent({ service: 'https://bsky.social' });
+const agent = new AtpAgent({ 
+  service: 'https://bsky.social',
+  fetchHandler: (url, init) => fetch(url, { ...init, signal: AbortSignal.timeout(30_000) })
+});
 
 async function postToBlueski() {
+  // Diagnostic - remove after confirming
+  const testRes = await fetch('https://bsky.social/xrpc/_health');
+  console.log('Bluesky reachable:', testRes.status, await testRes.text());
+  
   await agent.login({
     identifier: process.env.BSKY_HANDLE,
     password: process.env.BSKY_APP_PASSWORD,
