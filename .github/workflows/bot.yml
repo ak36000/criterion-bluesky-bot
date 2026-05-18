@@ -5,6 +5,9 @@ on:
     - cron: '*/2 * * * *'   # every 2 minutes
   workflow_dispatch:          # lets you trigger it manually too
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   post:
     runs-on: ubuntu-latest
