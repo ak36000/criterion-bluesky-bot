@@ -1,0 +1,35 @@
+name: Criterion Bot
+
+on:
+  schedule:
+    - cron: '*/2 * * * *'   # every 2 minutes
+  workflow_dispatch:          # lets you trigger it manually too
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write         # needed to commit state file
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install deps
+        run: npm install node-fetch cheerio @atproto/api
+
+      - name: Run bot
+        env:
+          BSKY_HANDLE: ${{ secrets.BSKY_HANDLE }}
+          BSKY_APP_PASSWORD: ${{ secrets.BSKY_APP_PASSWORD }}
+        run: node bot.js
+
+      - name: Commit state
+        run: |
+          git config user.name "criterion-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add state.json
+          git diff --staged --quiet || git commit -m "update state" && git push
