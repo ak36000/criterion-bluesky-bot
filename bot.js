@@ -27,7 +27,18 @@ if (!title && moreHref) {
 }
 
 const moreHref = $('a').filter((_, el) => $(el).text().trim() === 'More').first().attr('href');
-const nextText = $('body').text().match(/Next film starts in:\s*(.+)/i)?.[1]?.trim() ?? 'unknown';
+const nextRaw = $('body').text().match(/Next film starts in:\s*(\d+)\s*minute/i)?.[1];
+const minutesUntilNext = nextRaw ? parseInt(nextRaw) : null;
+
+let nextText = 'unknown';
+if (minutesUntilNext !== null) {
+  const nextTime = new Date(Date.now() + minutesUntilNext * 60 * 1000);
+  const etTime = nextTime.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: 'America/New_York' });
+  const ptTime = nextTime.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: 'America/Los_Angeles' });
+  const etZone = nextTime.toLocaleDateString('en-US', { timeZone: 'America/New_York', timeZoneName: 'short' }).split(', ')[1] ?? 'ET';
+  const ptZone = nextTime.toLocaleDateString('en-US', { timeZone: 'America/Los_Angeles', timeZoneName: 'short' }).split(', ')[1] ?? 'PT';
+  nextText = `${minutesUntilNext} minutes (${etTime} ${etZone}/${ptTime} ${ptZone})`;
+}
 
 console.log(`Now playing: ${title}`);
 console.log(`More link: ${moreHref}`);
@@ -57,7 +68,19 @@ await agent.login({
 
 // Build post text
 const filmLink = moreHref ?? 'https://www.criterionchannel.com/events/criterion-24-7';
-const postText = `🎬 Now streaming on Criterion Channel 24/7:\n\n${title}\n\nNext film starts in: ${nextText}\n\n${filmLink}`;
+const linkText = 'Watch on Criterion Channel';
+const postText = `🎬 Now streaming on Criterion Channel 24/7:\n\n${title}\n\nNext film starts in: ${nextText}\n\n${linkText}`;
+
+// Calculate byte positions of the link text (Bluesky facets use UTF-8 byte offsets)
+const encoder = new TextEncoder();
+const beforeLink = postText.slice(0, postText.lastIndexOf(linkText));
+const byteStart = encoder.encode(beforeLink).length;
+const byteEnd = byteStart + encoder.encode(linkText).length;
+
+const facets = [{
+  index: { byteStart, byteEnd },
+  features: [{ $type: 'app.bsky.richtext.facet#link', uri: filmLink }],
+}];
 
 // Upload image if available
 let embed = undefined;
@@ -66,26 +89,17 @@ if (imageUrl) {
     const imgRes = await fetch(imageUrl);
     const imgBuffer = await imgRes.arrayBuffer();
     const contentType = imgRes.headers.get('content-type') ?? 'image/jpeg';
-
     const uploadRes = await agent.uploadBlob(Buffer.from(imgBuffer), { encoding: contentType });
     embed = {
       $type: 'app.bsky.embed.images',
-      images: [{
-        image: uploadRes.data.blob,
-        alt: `Film poster for ${title}`,
-      }],
+      images: [{ image: uploadRes.data.blob, alt: `Film poster for ${title}` }],
     };
   } catch (e) {
     console.warn('Image upload failed, posting without image:', e.message);
   }
 }
 
-await agent.post({
-  text: postText,
-  embed,
-  createdAt: new Date().toISOString(),
-});
-
+await agent.post({ text: postText, facets, embed, createdAt: new Date().toISOString() });
 console.log(`Posted: ${title}`);
 
 // --- Save new state ---
