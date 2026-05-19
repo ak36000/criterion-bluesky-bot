@@ -76,12 +76,15 @@ const facets = [{
 
 // --- Post to Bluesky with retries ---
 const agent = new AtpAgent({ service: 'https://bsky.social' });
+console.log('Attempting Bluesky login...');
 
 async function postToBluesky() {
+  console.log('Logging in...');
   await agent.login({
     identifier: process.env.BSKY_HANDLE,
     password: process.env.BSKY_APP_PASSWORD,
   });
+  console.log('Logged in successfully.');
 
   // Upload image if available
   let embed = undefined;
