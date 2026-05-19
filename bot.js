@@ -75,7 +75,10 @@ const facets = [{
 }];
 
 // --- Post to Bluesky with retries ---
-const agent = new AtpAgent({ service: 'https://bsky.social' });
+const agent = new AtpAgent({ 
+  service: 'https://bsky.social',
+  fetch: (url, init) => fetch(url, { ...init, signal: AbortSignal.timeout(30_000) })
+});
 console.log('Attempting Bluesky login...');
 
 async function postToBluesky() {
