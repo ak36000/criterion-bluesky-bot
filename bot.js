@@ -1,4 +1,4 @@
-import fetch from 'node-fetch';
+const fetch = globalThis.fetch;
 import * as cheerio from 'cheerio';
 import fs from 'fs';
 
