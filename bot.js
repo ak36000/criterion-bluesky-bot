@@ -51,7 +51,7 @@ if (!title || title === state.lastTitle) {
 // --- Fetch film page for og:image ---
 let imageUrl = null;
 if (moreHref) {
-  const filmRes = await fetch(moreHref);
+  const filmRes = await fetch(moreHref, { signal: AbortSignal.timeout(15_000) });
   const filmHtml = await filmRes.text();
   const $film = cheerio.load(filmHtml);
   imageUrl = $film('meta[property="og:image"]').attr('content') ?? null;
@@ -73,17 +73,9 @@ const facets = [{
   features: [{ $type: 'app.bsky.richtext.facet#link', uri: filmLink }],
 }];
 
-// --- Post to Bluesky with retries ---
-const agent = new AtpAgent({ 
-  service: 'https://bsky.social',
-  fetch: (url, init) => fetch(url, { ...init, signal: AbortSignal.timeout(30_000) })
-});
-console.log('Attempting Bluesky login...');
-
+// --- Post to Bluesky via raw HTTP (no @atproto/api) ---
 async function postToBluesky() {
   console.log('Logging in...');
-  
-  // Login directly via HTTP
   const loginRes = await fetch('https://bsky.social/xrpc/com.atproto.server.createSession', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -93,7 +85,7 @@ async function postToBluesky() {
     }),
     signal: AbortSignal.timeout(30_000),
   });
-  
+
   if (!loginRes.ok) throw new Error(`Login failed: ${loginRes.status} ${await loginRes.text()}`);
   const { accessJwt, did } = await loginRes.json();
   console.log('Logged in successfully.');
@@ -105,7 +97,7 @@ async function postToBluesky() {
       const imgRes = await fetch(imageUrl, { signal: AbortSignal.timeout(30_000) });
       const imgBuffer = await imgRes.arrayBuffer();
       const contentType = imgRes.headers.get('content-type') ?? 'image/jpeg';
-      
+
       const uploadRes = await fetch('https://bsky.social/xrpc/com.atproto.repo.uploadBlob', {
         method: 'POST',
         headers: {
@@ -115,19 +107,22 @@ async function postToBluesky() {
         body: Buffer.from(imgBuffer),
         signal: AbortSignal.timeout(30_000),
       });
+
       if (uploadRes.ok) {
         const { blob } = await uploadRes.json();
         embed = {
           $type: 'app.bsky.embed.images',
           images: [{ image: blob, alt: `Film poster for ${title}` }],
         };
+      } else {
+        console.warn('Image upload failed:', await uploadRes.text());
       }
     } catch (e) {
       console.warn('Image upload failed, posting without image:', e.message);
     }
   }
 
-  // Post
+  // Create post
   const postRes = await fetch('https://bsky.social/xrpc/com.atproto.repo.createRecord', {
     method: 'POST',
     headers: {
@@ -137,14 +132,21 @@ async function postToBluesky() {
     body: JSON.stringify({
       repo: did,
       collection: 'app.bsky.feed.post',
-      record: { $type: 'app.bsky.feed.post', text: postText, facets, embed, createdAt: new Date().toISOString() },
+      record: {
+        $type: 'app.bsky.feed.post',
+        text: postText,
+        facets,
+        embed,
+        createdAt: new Date().toISOString(),
+      },
     }),
     signal: AbortSignal.timeout(30_000),
   });
-  
+
   if (!postRes.ok) throw new Error(`Post failed: ${postRes.status} ${await postRes.text()}`);
 }
 
+// Retry up to 3 times with 10-second delay
 let lastError;
 for (let attempt = 1; attempt <= 3; attempt++) {
   try {
