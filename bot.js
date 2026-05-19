@@ -1,8 +1,7 @@
 import fetch from 'node-fetch';
 import * as cheerio from 'cheerio';
-import { AtpAgent, BlobRef } from '@atproto/api';
+import { AtpAgent } from '@atproto/api';
 import fs from 'fs';
-import { Agent } from 'node:http';
 
 const STATE_FILE = 'state.json';
 
@@ -17,7 +16,8 @@ const nowRes = await fetch('https://whatsonnow.criterionchannel.com/');
 const nowHtml = await nowRes.text();
 const $ = cheerio.load(nowHtml);
 
-// The page lists "What's on now: TITLE" and a More link
+const moreHref = $('a').filter((_, el) => $(el).text().trim() === 'More').first().attr('href');
+
 const nowText = $('a').filter((_, el) => /what'?s on now/i.test($(el).text())).first().text().trim();
 let title = nowText.replace(/^What'?s on now:\s*/i, '').trim();
 
@@ -27,7 +27,6 @@ if (!title && moreHref) {
   title = slug.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 }
 
-const moreHref = $('a').filter((_, el) => $(el).text().trim() === 'More').first().attr('href');
 const nextRaw = $('body').text().match(/Next film starts in:\s*(\d+)\s*minute/i)?.[1];
 const minutesUntilNext = nextRaw ? parseInt(nextRaw) : null;
 
@@ -60,49 +59,11 @@ if (moreHref) {
   console.log(`Image URL: ${imageUrl}`);
 }
 
-// --- Post to Bluesky with retries ---
-const agent = new AtpAgent({ 
-  service: 'https://bsky.social',
-  fetchHandler: (url, init) => fetch(url, { ...init, signal: AbortSignal.timeout(30_000) })
-});
-
-async function postToBlueski() {
-  // Diagnostic - remove after confirming
-  const testRes = await fetch('https://bsky.social/xrpc/_health');
-  console.log('Bluesky reachable:', testRes.status, await testRes.text());
-  
-  await agent.login({
-    identifier: process.env.BSKY_HANDLE,
-    password: process.env.BSKY_APP_PASSWORD,
-  });
-
-  // ... (keep all your existing image upload and facets code here) ...
-
-  await agent.post({ text: postText, facets, embed, createdAt: new Date().toISOString() });
-}
-
-// Retry up to 3 times with a 10-second delay between attempts
-let lastError;
-for (let attempt = 1; attempt <= 3; attempt++) {
-  try {
-    await postToBlueski();
-    console.log(`Posted: ${title}`);
-    lastError = null;
-    break;
-  } catch (e) {
-    lastError = e;
-    console.warn(`Attempt ${attempt} failed: ${e.message}`);
-    if (attempt < 3) await new Promise(r => setTimeout(r, 10_000));
-  }
-}
-if (lastError) throw lastError;
-
-// Build post text
+// --- Build post text and facets ---
 const filmLink = moreHref ?? 'https://www.criterionchannel.com/events/criterion-24-7';
 const linkText = 'Watch on Criterion Channel';
 const postText = `🎬 Now streaming on Criterion Channel 24/7:\n\n${title}\n\nNext film starts in: ${nextText}\n\n${linkText}`;
 
-// Calculate byte positions of the link text (Bluesky facets use UTF-8 byte offsets)
 const encoder = new TextEncoder();
 const beforeLink = postText.slice(0, postText.lastIndexOf(linkText));
 const byteStart = encoder.encode(beforeLink).length;
@@ -113,25 +74,49 @@ const facets = [{
   features: [{ $type: 'app.bsky.richtext.facet#link', uri: filmLink }],
 }];
 
-// Upload image if available
-let embed = undefined;
-if (imageUrl) {
-  try {
-    const imgRes = await fetch(imageUrl);
-    const imgBuffer = await imgRes.arrayBuffer();
-    const contentType = imgRes.headers.get('content-type') ?? 'image/jpeg';
-    const uploadRes = await agent.uploadBlob(Buffer.from(imgBuffer), { encoding: contentType });
-    embed = {
-      $type: 'app.bsky.embed.images',
-      images: [{ image: uploadRes.data.blob, alt: `Film poster for ${title}` }],
-    };
-  } catch (e) {
-    console.warn('Image upload failed, posting without image:', e.message);
+// --- Post to Bluesky with retries ---
+const agent = new AtpAgent({ service: 'https://bsky.social' });
+
+async function postToBluesky() {
+  await agent.login({
+    identifier: process.env.BSKY_HANDLE,
+    password: process.env.BSKY_APP_PASSWORD,
+  });
+
+  // Upload image if available
+  let embed = undefined;
+  if (imageUrl) {
+    try {
+      const imgRes = await fetch(imageUrl);
+      const imgBuffer = await imgRes.arrayBuffer();
+      const contentType = imgRes.headers.get('content-type') ?? 'image/jpeg';
+      const uploadRes = await agent.uploadBlob(Buffer.from(imgBuffer), { encoding: contentType });
+      embed = {
+        $type: 'app.bsky.embed.images',
+        images: [{ image: uploadRes.data.blob, alt: `Film poster for ${title}` }],
+      };
+    } catch (e) {
+      console.warn('Image upload failed, posting without image:', e.message);
+    }
   }
+
+  await agent.post({ text: postText, facets, embed, createdAt: new Date().toISOString() });
 }
 
-await agent.post({ text: postText, facets, embed, createdAt: new Date().toISOString() });
-console.log(`Posted: ${title}`);
+let lastError;
+for (let attempt = 1; attempt <= 3; attempt++) {
+  try {
+    await postToBluesky();
+    console.log(`Posted: ${title}`);
+    lastError = null;
+    break;
+  } catch (e) {
+    lastError = e;
+    console.warn(`Attempt ${attempt} failed: ${e.message}`);
+    if (attempt < 3) await new Promise(r => setTimeout(r, 10_000));
+  }
+}
+if (lastError) throw lastError;
 
 // --- Save new state ---
 state.lastTitle = title;
