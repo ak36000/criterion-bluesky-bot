@@ -73,6 +73,13 @@ const facets = [{
   features: [{ $type: 'app.bsky.richtext.facet#link', uri: filmLink }],
 }];
 
+// Temporary network diagnostic - remove after testing
+const dnsTest = await fetch('https://bsky.social/xrpc/_health', { signal: AbortSignal.timeout(10_000) }).catch(e => e);
+console.log('bsky.social health:', dnsTest?.status ?? dnsTest?.message);
+
+const altTest = await fetch('https://httpbin.org/get', { signal: AbortSignal.timeout(10_000) }).catch(e => e);
+console.log('General internet:', altTest?.status ?? altTest?.message);
+
 // --- Post to Bluesky via raw HTTP (no @atproto/api) ---
 async function postToBluesky() {
   console.log('Logging in...');
