@@ -22,7 +22,7 @@ jobs:
           node-version: '24'
 
       - name: Install deps
-        run: npm install node-fetch cheerio
+        run: npm install cheerio
 
       - name: Run bot
         env:
