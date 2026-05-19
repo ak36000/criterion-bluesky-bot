@@ -1,6 +1,5 @@
 import fetch from 'node-fetch';
 import * as cheerio from 'cheerio';
-import { AtpAgent } from '@atproto/api';
 import fs from 'fs';
 
 const STATE_FILE = 'state.json';
@@ -83,30 +82,67 @@ console.log('Attempting Bluesky login...');
 
 async function postToBluesky() {
   console.log('Logging in...');
-  await agent.login({
-    identifier: process.env.BSKY_HANDLE,
-    password: process.env.BSKY_APP_PASSWORD,
+  
+  // Login directly via HTTP
+  const loginRes = await fetch('https://bsky.social/xrpc/com.atproto.server.createSession', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      identifier: process.env.BSKY_HANDLE,
+      password: process.env.BSKY_APP_PASSWORD,
+    }),
+    signal: AbortSignal.timeout(30_000),
   });
+  
+  if (!loginRes.ok) throw new Error(`Login failed: ${loginRes.status} ${await loginRes.text()}`);
+  const { accessJwt, did } = await loginRes.json();
   console.log('Logged in successfully.');
 
   // Upload image if available
   let embed = undefined;
   if (imageUrl) {
     try {
-      const imgRes = await fetch(imageUrl);
+      const imgRes = await fetch(imageUrl, { signal: AbortSignal.timeout(30_000) });
       const imgBuffer = await imgRes.arrayBuffer();
       const contentType = imgRes.headers.get('content-type') ?? 'image/jpeg';
-      const uploadRes = await agent.uploadBlob(Buffer.from(imgBuffer), { encoding: contentType });
-      embed = {
-        $type: 'app.bsky.embed.images',
-        images: [{ image: uploadRes.data.blob, alt: `Film poster for ${title}` }],
-      };
+      
+      const uploadRes = await fetch('https://bsky.social/xrpc/com.atproto.repo.uploadBlob', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${accessJwt}`,
+          'Content-Type': contentType,
+        },
+        body: Buffer.from(imgBuffer),
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (uploadRes.ok) {
+        const { blob } = await uploadRes.json();
+        embed = {
+          $type: 'app.bsky.embed.images',
+          images: [{ image: blob, alt: `Film poster for ${title}` }],
+        };
+      }
     } catch (e) {
       console.warn('Image upload failed, posting without image:', e.message);
     }
   }
 
-  await agent.post({ text: postText, facets, embed, createdAt: new Date().toISOString() });
+  // Post
+  const postRes = await fetch('https://bsky.social/xrpc/com.atproto.repo.createRecord', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${accessJwt}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      repo: did,
+      collection: 'app.bsky.feed.post',
+      record: { $type: 'app.bsky.feed.post', text: postText, facets, embed, createdAt: new Date().toISOString() },
+    }),
+    signal: AbortSignal.timeout(30_000),
+  });
+  
+  if (!postRes.ok) throw new Error(`Post failed: ${postRes.status} ${await postRes.text()}`);
 }
 
 let lastError;
