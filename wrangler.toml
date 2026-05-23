@@ -1,0 +1,18 @@
+name = "criterion-bluesky-bot"
+main = "worker.js"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+# Cron fires every minute; the Worker itself throttles via KV timestamps
+[triggers]
+crons = ["* * * * *"]
+
+# KV namespace — create with: wrangler kv namespace create CRITERION_STATE
+# then paste the id below
+[[kv_namespaces]]
+binding = "CRITERION_STATE"
+id = "59599cf7ef664bc7b200413f7a72ae4a"
+
+# Secrets (set via CLI, never stored here):
+#   wrangler secret put BSKY_HANDLE
+#   wrangler secret put BSKY_APP_PASSWORD
