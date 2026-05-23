@@ -1,3 +1,5 @@
+import sharp from 'sharp';
+
 const fetch = globalThis.fetch;
 import * as cheerio from 'cheerio';
 import fs from 'fs';
@@ -99,35 +101,36 @@ async function postToBluesky() {
 
   // Upload image if available
   let embed = undefined;
-  if (imageUrl) {
-    try {
-      const imgRes = await fetch(imageUrl, { signal: AbortSignal.timeout(30_000) });
-      const imgBuffer = await imgRes.arrayBuffer();
-      const contentType = imgRes.headers.get('content-type') ?? 'image/jpeg';
+  const imgRes = await fetch(imageUrl, { signal: AbortSignal.timeout(30_000) });
+const imgBuffer = await imgRes.arrayBuffer();
+const contentType = imgRes.headers.get('content-type') ?? 'image/jpeg';
 
-      const uploadRes = await fetch('https://bsky.social/xrpc/com.atproto.repo.uploadBlob', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${accessJwt}`,
-          'Content-Type': contentType,
-        },
-        body: Buffer.from(imgBuffer),
-        signal: AbortSignal.timeout(30_000),
-      });
+// Get image dimensions for correct aspect ratio display
+const { width, height } = await sharp(Buffer.from(imgBuffer)).metadata();
 
-      if (uploadRes.ok) {
-        const { blob } = await uploadRes.json();
-        embed = {
-          $type: 'app.bsky.embed.images',
-          images: [{ image: blob, alt: `Film poster for ${title}` }],
-        };
-      } else {
-        console.warn('Image upload failed:', await uploadRes.text());
-      }
-    } catch (e) {
-      console.warn('Image upload failed, posting without image:', e.message);
-    }
-  }
+const uploadRes = await fetch('https://bsky.social/xrpc/com.atproto.repo.uploadBlob', {
+  method: 'POST',
+  headers: {
+    'Authorization': `Bearer ${accessJwt}`,
+    'Content-Type': contentType,
+  },
+  body: Buffer.from(imgBuffer),
+  signal: AbortSignal.timeout(30_000),
+});
+
+if (uploadRes.ok) {
+  const { blob } = await uploadRes.json();
+  embed = {
+    $type: 'app.bsky.embed.images',
+    images: [{
+      image: blob,
+      alt: `Film poster for ${title}`,
+      aspectRatio: { width, height },  // ← this is the key addition
+    }],
+  };
+} else {
+  console.warn('Image upload failed:', await uploadRes.text());
+}
 
   // Create post
   const postRes = await fetch('https://bsky.social/xrpc/com.atproto.repo.createRecord', {
