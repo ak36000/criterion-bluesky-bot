@@ -200,9 +200,18 @@ async function runBot(env) {
 
         if (uploadRes.ok) {
           const { blob } = await uploadRes.json();
+
+          // Parse width/height from URL params (e.g. w=1280&h=720) for correct aspect ratio
+          const imgUrlParams = new URL(imageUrl).searchParams;
+          const imgWidth = parseInt(imgUrlParams.get('w') ?? '0');
+          const imgHeight = parseInt(imgUrlParams.get('h') ?? '0');
+          const aspectRatio = (imgWidth && imgHeight)
+            ? { width: imgWidth, height: imgHeight }
+            : undefined;
+
           embed = {
             $type: 'app.bsky.embed.images',
-            images: [{ image: blob, alt: `Film poster for ${title}` }],
+            images: [{ image: blob, alt: `Film poster for ${title}`, aspectRatio }],
           };
         } else {
           console.warn('Image upload failed:', await uploadRes.text());
