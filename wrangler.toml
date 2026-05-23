@@ -16,3 +16,7 @@ id = "59599cf7ef664bc7b200413f7a72ae4a"
 # Secrets (set via CLI, never stored here):
 #   wrangler secret put BSKY_HANDLE
 #   wrangler secret put BSKY_APP_PASSWORD
+
+[observability.logs]
+enabled = true
+invocation_logs = true
