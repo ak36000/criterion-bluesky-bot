@@ -138,6 +138,7 @@ async function runBot(env) {
 
   // --- Fetch og:image ---
   let imageUrl = null;
+  let filmInfo = '';
   if (moreHref) {
     try {
       const filmRes = await fetch(moreHref, { signal: AbortSignal.timeout(15_000) });
@@ -145,6 +146,14 @@ async function runBot(env) {
       const $film = cheerio.load(filmHtml);
       imageUrl = $film('meta[property="og:image"]').attr('content') ?? null;
       console.log(`Image URL: ${imageUrl}`);
+
+      // Extract director/year/country and cast from og:description
+      const desc = $film('meta[property="og:description"]').attr('content') ?? '';
+      const descLines = desc.split('\n').map(l => l.trim()).filter(Boolean);
+      const dirLine = descLines.find(l => /^Directed by /i.test(l)) ?? '';
+      const starLine = descLines.find(l => /^Starring /i.test(l)) ?? '';
+      filmInfo = [dirLine, starLine].filter(Boolean).join('\n');
+      console.log(`Film info: ${filmInfo}`);
     } catch (e) {
       console.warn('Could not fetch film page:', e.message);
     }
@@ -152,8 +161,31 @@ async function runBot(env) {
 
   const filmLink = moreHref ?? 'https://www.criterionchannel.com/events/criterion-24-7';
   const linkText = 'Watch on Criterion Channel';
-  const postText = `🎬 Now streaming on Criterion Channel 24/7:\n\n${title}\n\nNext film starts in: ${nextText}\n\n${linkText}`;
 
+  // Bluesky's limit is 300 graphemes
+  const BSKY_LIMIT = 300;
+
+  function truncateFilmInfo(info, budget) {
+    if (!info) return '';
+    const lines = info.split('\n');
+    // Try both lines
+    if ([...info].length <= budget) return info;
+    // Try just the directed-by line
+    if (lines.length > 1 && [...lines[0]].length <= budget) return lines[0];
+    // Last resort: truncate with ellipsis
+    return [...lines[0]].slice(0, budget - 1).join('') + '…';
+  }
+
+  // Calculate budget: measure the base post (without filmInfo) and see what's left
+  const basePost = `🎬 Now streaming on Criterion Channel 24/7:\n\n${title}\n\nNext film starts in: ${nextText}\n\n${linkText}`;
+  const baseCost = [...basePost].length;
+  const filmInfoBudget = Math.max(0, BSKY_LIMIT - baseCost - 1); // -1 for the extra \n separator
+
+  const filmInfoTrimmed = truncateFilmInfo(filmInfo, filmInfoBudget);
+  const postText = filmInfoTrimmed
+    ? `🎬 Now streaming on Criterion Channel 24/7:\n\n${title}\n${filmInfoTrimmed}\n\nNext film starts in: ${nextText}\n\n${linkText}`
+    : basePost;
+	
   const encoder = new TextEncoder();
   const beforeLink = postText.slice(0, postText.lastIndexOf(linkText));
   const byteStart = encoder.encode(beforeLink).length;
