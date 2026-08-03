@@ -86,6 +86,12 @@ export default {
     const url = new URL(request.url);
     if (url.searchParams.get('dryRun') === 'true') {
       const result = await runBot(env, { dryRun: true });
+      if (!result) {
+        return new Response(
+          JSON.stringify({ error: 'runBot returned nothing — check wrangler tail logs for details.' }, null, 2),
+          { status: 500, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
       return new Response(JSON.stringify(result, null, 2), {
         headers: { 'Content-Type': 'application/json' },
       });
@@ -109,10 +115,13 @@ async function runBot(env, { dryRun = false } = {}) {
   const nextCheckAt = nextCheckAtStr ? new Date(nextCheckAtStr).getTime() : 0;
   const fastPollCount = fastPollCountStr ? parseInt(fastPollCountStr) : 0;
 
-  // --- Respect the scheduled wait ---
-  if (nextCheckAt && now < nextCheckAt) {
+  // --- Respect the scheduled wait (skip this gate during a dry run) ---
+  if (nextCheckAt && now < nextCheckAt && !dryRun) {
     console.log(`Skipping — next check scheduled for ${new Date(nextCheckAt).toISOString()}`);
     return;
+  }
+  if (nextCheckAt && now < nextCheckAt && dryRun) {
+    console.log(`(Dry run ignoring schedule gate — normally would skip until ${new Date(nextCheckAt).toISOString()})`);
   }
 
   // --- Scrape What's On Now ---
