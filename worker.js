@@ -13,13 +13,88 @@
 
 import * as cheerio from 'cheerio';
 
+// The generic link Criterion falls back to when there's no dedicated film page.
+const GENERIC_LINK = 'https://www.criterionchannel.com/events/criterion-24-7';
+
+function isGenericLink(href) {
+  if (!href) return true;
+  return href.replace(/\/$/, '') === GENERIC_LINK;
+}
+
+// Criterion film page URLs are just the title, lowercased and hyphenated,
+// e.g. "The Tit and the Moon" -> criterionchannel.com/the-tit-and-the-moon
+function slugify(str) {
+  return str
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '') // strip accents/diacritics
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, '')    // strip punctuation
+    .trim()
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-');
+}
+
+// Try to guess a film's Criterion Channel page from its title, and scrape
+// image + director/cast info from it, in the same shape the moreHref path
+// already produces (imageUrl, filmInfo as "Directed by ...\nStarring ...").
+// Returns null if we can't confidently find the right page - callers should
+// treat that as "no extra info available" and continue gracefully.
+async function guessAndScrapeFilmPage(title) {
+  const slug = slugify(title);
+  if (!slug) return null;
+
+  const url = `https://www.criterionchannel.com/${slug}`;
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(15_000) });
+    if (!res.ok) return null;
+
+    const html = await res.text();
+    const $page = cheerio.load(html);
+
+    // Sanity check: make sure the guessed page is actually about this film,
+    // not a 404 that returns 200, a redirect to the homepage, etc.
+    const ogTitle = $page('meta[property="og:title"]').attr('content') ?? '';
+    const cleanOgTitle = ogTitle.replace(/\s*-\s*The Criterion Channel\s*$/i, '').trim().toLowerCase();
+    if (cleanOgTitle !== title.trim().toLowerCase()) {
+      console.log(`Guessed URL ${url} didn't match ("${ogTitle}"), skipping.`);
+      return null;
+    }
+
+    const imageUrl = $page('meta[property="og:image"]').attr('content') ?? null;
+    const desc = $page('meta[property="og:description"]').attr('content') ?? '';
+    const descLines = desc.split('\n').map(l => l.trim()).filter(Boolean);
+    const dirLine = descLines.find(l => /^Directed by /i.test(l)) ?? '';
+    const starLine = descLines.find(l => /^Starring /i.test(l)) ?? '';
+    const filmInfo = [dirLine, starLine].filter(Boolean).join('\n');
+
+    return { filmLink: url, imageUrl, filmInfo };
+  } catch (e) {
+    console.warn(`Guess-and-scrape failed for "${title}":`, e.message);
+    return null;
+  }
+}
+
 export default {
   async scheduled(event, env, ctx) {
     ctx.waitUntil(runBot(env));
   },
+
+  // Manual HTTP trigger, for testing only. Visiting the worker's URL with
+  // ?dryRun=true runs the full scrape/guess pipeline and returns what it
+  // *would* post, without touching KV state or Bluesky. Safe to hit anytime.
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    if (url.searchParams.get('dryRun') === 'true') {
+      const result = await runBot(env, { dryRun: true });
+      return new Response(JSON.stringify(result, null, 2), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    return new Response('Criterion Bluesky Bot. Add ?dryRun=true to preview without posting.');
+  },
 };
 
-async function runBot(env) {
+async function runBot(env, { dryRun = false } = {}) {
   const KV = env.CRITERION_STATE;
 
   // --- Load state ---
@@ -113,16 +188,21 @@ async function runBot(env) {
     }
   }
 
-  // --- Save scheduling state (always) ---
-  await Promise.all([
-    KV.put('nextCheckAt', new Date(nextCheckMs).toISOString()),
-    KV.put('pollMode', newPollMode),
-    KV.put('fastPollCount', String(newFastPollCount)),
-  ]);
+  // --- Save scheduling state (always, except during a dry run) ---
+  if (!dryRun) {
+    await Promise.all([
+      KV.put('nextCheckAt', new Date(nextCheckMs).toISOString()),
+      KV.put('pollMode', newPollMode),
+      KV.put('fastPollCount', String(newFastPollCount)),
+    ]);
+  }
 
-  if (!titleChanged) {
+  if (!titleChanged && !dryRun) {
     console.log('No new film. Done.');
     return;
+  }
+  if (!titleChanged && dryRun) {
+    console.log('No new film (dry run continues anyway, to preview the current film).');
   }
 
   // --- Build the post text ---
@@ -136,10 +216,14 @@ async function runBot(env) {
     nextText = `${minutesUntilNext} minutes (${etTime} ${etZone}/${ptTime} ${ptZone})`;
   }
 
-  // --- Fetch og:image ---
+  // --- Fetch og:image / director / cast ---
   let imageUrl = null;
   let filmInfo = '';
-  if (moreHref) {
+  let filmLink = moreHref ?? GENERIC_LINK;
+  let usedGuessedPage = false;
+
+  if (moreHref && !isGenericLink(moreHref)) {
+    // Normal case: Criterion gave us a real, dedicated film link.
     try {
       const filmRes = await fetch(moreHref, { signal: AbortSignal.timeout(15_000) });
       const filmHtml = await filmRes.text();
@@ -157,9 +241,23 @@ async function runBot(env) {
     } catch (e) {
       console.warn('Could not fetch film page:', e.message);
     }
+  } else {
+    // No dedicated film link on the page - try guessing the URL from the title.
+    console.log('No dedicated film link found; attempting to guess the film page URL...');
+    const scraped = await guessAndScrapeFilmPage(title);
+    if (scraped) {
+      console.log(`Guessed film page: ${scraped.filmLink}`);
+      console.log(`Image URL: ${scraped.imageUrl}`);
+      console.log(`Film info: ${scraped.filmInfo}`);
+      imageUrl = scraped.imageUrl;
+      filmInfo = scraped.filmInfo;
+      filmLink = scraped.filmLink;
+      usedGuessedPage = true;
+    } else {
+      console.log('Could not confirm a guessed film page; posting without extra metadata.');
+    }
   }
 
-  const filmLink = moreHref ?? 'https://www.criterionchannel.com/events/criterion-24-7';
   const linkText = 'Watch on Criterion Channel';
 
   // Bluesky's limit is 300 graphemes
@@ -274,6 +372,22 @@ async function runBot(env) {
     });
 
     if (!postRes.ok) throw new Error(`Post failed: ${postRes.status} ${await postRes.text()}`);
+  }
+
+  if (dryRun) {
+    console.log('--- DRY RUN: not posting to Bluesky, not saving state ---');
+    return {
+      dryRun: true,
+      title,
+      titleChanged,
+      moreHref,
+      usedGuessedPage,
+      filmLink,
+      imageUrl,
+      filmInfo,
+      postText,
+      facets,
+    };
   }
 
   // Retry up to 3 times
