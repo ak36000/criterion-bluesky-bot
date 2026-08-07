@@ -21,57 +21,67 @@ function isGenericLink(href) {
   return href.replace(/\/$/, '') === GENERIC_LINK;
 }
 
-// Criterion film page URLs are just the title, lowercased and hyphenated,
-// e.g. "The Tit and the Moon" -> criterionchannel.com/the-tit-and-the-moon
+// Criterion film page URLs are just the title, lowercased with any run of
+// punctuation/whitespace collapsed to a single hyphen -
+// e.g. "The Tit and the Moon" -> the-tit-and-the-moon
+//      "God's Country"        -> god-s-country   (apostrophe becomes a hyphen, not deleted)
 function slugify(str) {
   return str
     .normalize('NFKD')
-    .replace(/[\u0300-\u036f]/g, '') // strip accents/diacritics
+    .replace(/[\u0300-\u036f]/g, '')  // strip accents/diacritics
     .toLowerCase()
-    .replace(/[^a-z0-9\s-]/g, '')    // strip punctuation
-    .trim()
-    .replace(/\s+/g, '-')
-    .replace(/-+/g, '-');
+    .replace(/[^a-z0-9]+/g, '-')      // any run of non-alphanumeric chars -> one hyphen
+    .replace(/^-+|-+$/g, '');         // trim leading/trailing hyphens
 }
 
 // Try to guess a film's Criterion Channel page from its title, and scrape
 // image + director/cast info from it, in the same shape the moreHref path
 // already produces (imageUrl, filmInfo as "Directed by ...\nStarring ...").
-// Returns null if we can't confidently find the right page - callers should
-// treat that as "no extra info available" and continue gracefully.
+// Some titles exist more than once in the catalog (reissues, different cuts),
+// where Criterion disambiguates with a "-1", "-2" suffix - so if the plain
+// slug doesn't resolve to a matching page, we try a few numbered variants
+// before giving up. Returns null if nothing confidently matches - callers
+// should treat that as "no extra info available" and continue gracefully.
 async function guessAndScrapeFilmPage(title) {
-  const slug = slugify(title);
-  if (!slug) return null;
+  const baseSlug = slugify(title);
+  if (!baseSlug) return null;
 
-  const url = `https://www.criterionchannel.com/${slug}`;
-  try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(15_000) });
-    if (!res.ok) return null;
+  const candidateSlugs = [baseSlug, `${baseSlug}-1`, `${baseSlug}-2`, `${baseSlug}-3`];
 
-    const html = await res.text();
-    const $page = cheerio.load(html);
+  for (const slug of candidateSlugs) {
+    const url = `https://www.criterionchannel.com/${slug}`;
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(15_000) });
+      if (!res.ok) continue;
 
-    // Sanity check: make sure the guessed page is actually about this film,
-    // not a 404 that returns 200, a redirect to the homepage, etc.
-    const ogTitle = $page('meta[property="og:title"]').attr('content') ?? '';
-    const cleanOgTitle = ogTitle.replace(/\s*-\s*The Criterion Channel\s*$/i, '').trim().toLowerCase();
-    if (cleanOgTitle !== title.trim().toLowerCase()) {
-      console.log(`Guessed URL ${url} didn't match ("${ogTitle}"), skipping.`);
-      return null;
+      const html = await res.text();
+      const $page = cheerio.load(html);
+
+      // Sanity check: make sure the guessed page is actually about this film,
+      // not a 404 that returns 200, a redirect to the homepage, etc.
+      const ogTitle = $page('meta[property="og:title"]').attr('content') ?? '';
+      const cleanOgTitle = ogTitle.replace(/\s*-\s*The Criterion Channel\s*$/i, '').trim().toLowerCase();
+      if (cleanOgTitle !== title.trim().toLowerCase()) {
+        console.log(`Guessed URL ${url} didn't match ("${ogTitle}"), trying next candidate...`);
+        continue;
+      }
+
+      const imageUrl = $page('meta[property="og:image"]').attr('content') ?? null;
+      const desc = $page('meta[property="og:description"]').attr('content') ?? '';
+      const descLines = desc.split('\n').map(l => l.trim()).filter(Boolean);
+      const dirLine = descLines.find(l => /^Directed by /i.test(l)) ?? '';
+      const starLine = descLines.find(l => /^Starring /i.test(l)) ?? '';
+      const filmInfo = [dirLine, starLine].filter(Boolean).join('\n');
+
+      return { filmLink: url, imageUrl, filmInfo };
+    } catch (e) {
+      console.warn(`Guess-and-scrape failed for ${url}:`, e.message);
+      // fall through and try the next candidate
     }
-
-    const imageUrl = $page('meta[property="og:image"]').attr('content') ?? null;
-    const desc = $page('meta[property="og:description"]').attr('content') ?? '';
-    const descLines = desc.split('\n').map(l => l.trim()).filter(Boolean);
-    const dirLine = descLines.find(l => /^Directed by /i.test(l)) ?? '';
-    const starLine = descLines.find(l => /^Starring /i.test(l)) ?? '';
-    const filmInfo = [dirLine, starLine].filter(Boolean).join('\n');
-
-    return { filmLink: url, imageUrl, filmInfo };
-  } catch (e) {
-    console.warn(`Guess-and-scrape failed for "${title}":`, e.message);
-    return null;
   }
+
+  console.log(`No matching page found for "${title}" after trying ${candidateSlugs.length} candidate URL(s).`);
+  return null;
 }
 
 export default {
