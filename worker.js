@@ -34,6 +34,33 @@ function slugify(str) {
     .replace(/^-+|-+$/g, '');         // trim leading/trailing hyphens
 }
 
+// --- Deterministic record key, used to make duplicate posts impossible ---
+// Two concurrent invocations for the same film compute the same key, and the
+// PDS refuses to create a second record at an existing key.
+const B32 = '234567abcdefghijklmnopqrstuvwxyz';
+
+function makeTid(micros, clockId) {
+  let v = (BigInt(micros) << 10n) | BigInt(clockId & 1023);
+  let out = '';
+  for (let i = 0; i < 13; i++) { out = B32[Number(v & 31n)] + out; v >>= 5n; }
+  return out;
+}
+
+function hash10(str) {
+  let h = 2166136261;
+  for (const c of str) { h ^= c.charCodeAt(0); h = Math.imul(h, 16777619); }
+  return (h >>> 0) & 1023;
+}
+
+// Same title within the same 30-minute bucket => same key.
+// The title hash goes in the 10-bit clock id, so a different film in the same
+// bucket gets a different key (a 1-in-1024 collision chance).
+function dedupeRkey(title, nowMs) {
+  const BUCKET_MS = 30 * 60 * 1000;
+  const bucketMicros = Math.floor(nowMs / BUCKET_MS) * BUCKET_MS * 1000;
+  return makeTid(bucketMicros, hash10(title));
+}
+
 // Try to guess a film's Criterion Channel page from its title, and scrape
 // image + director/cast info from it, in the same shape the moreHref path
 // already produces (imageUrl, filmInfo as "Directed by ...\nStarring ...").
@@ -86,7 +113,13 @@ async function guessAndScrapeFilmPage(title) {
 
 export default {
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(runBot(env));
+    const invocationId = crypto.randomUUID().slice(0, 8);
+    console.log(`[${invocationId}] INVOKE`, JSON.stringify({
+      cron: event.cron,
+      scheduledTime: new Date(event.scheduledTime).toISOString(),
+      startedAt: new Date().toISOString(),
+    }));
+    ctx.waitUntil(runBot(env, { invocationId, scheduledTime: event.scheduledTime }));
   },
 
   // Manual HTTP trigger, for testing only. Visiting the worker's URL with
@@ -110,7 +143,14 @@ export default {
   },
 };
 
-async function runBot(env, { dryRun = false } = {}) {
+async function runBot(env, { dryRun = false, invocationId = 'manual', scheduledTime = null } = {}) {
+  // Shadow console so every log line inside runBot (including the nested
+  // postToBluesky) is tagged with this invocation's id. No other console.log
+  // edits are needed.
+  const console = {
+    log: (...a) => globalThis.console.log(`[${invocationId}]`, ...a),
+    warn: (...a) => globalThis.console.warn(`[${invocationId}]`, ...a),
+  };
   const KV = env.CRITERION_STATE;
 
   // --- Load state ---
@@ -124,6 +164,12 @@ async function runBot(env, { dryRun = false } = {}) {
   const now = Date.now();
   const nextCheckAt = nextCheckAtStr ? new Date(nextCheckAtStr).getTime() : 0;
   const fastPollCount = fastPollCountStr ? parseInt(fastPollCountStr) : 0;
+  
+    console.log('STATE_READ', JSON.stringify({
+    lastTitle, nextCheckAtStr, pollMode, fastPollCountStr,
+    now: new Date(now).toISOString(),
+    scheduledTime: scheduledTime ? new Date(scheduledTime).toISOString() : null,
+  }));
 
   // --- Respect the scheduled wait (skip this gate during a dry run) ---
   if (nextCheckAt && now < nextCheckAt && !dryRun) {
@@ -313,6 +359,9 @@ async function runBot(env, { dryRun = false } = {}) {
     features: [{ $type: 'app.bsky.richtext.facet#link', uri: filmLink }],
   }];
 
+  const rkey = dedupeRkey(title, now);
+  console.log('RKEY', rkey);
+ 
   // --- Post to Bluesky ---
   async function postToBluesky() {
     console.log('Logging in to Bluesky...');
@@ -379,6 +428,7 @@ async function runBot(env, { dryRun = false } = {}) {
       body: JSON.stringify({
         repo: did,
         collection: 'app.bsky.feed.post',
+		rkey,
         record: {
           $type: 'app.bsky.feed.post',
           text: postText,
@@ -390,8 +440,23 @@ async function runBot(env, { dryRun = false } = {}) {
       signal: AbortSignal.timeout(30_000),
     });
 
-    if (!postRes.ok) throw new Error(`Post failed: ${postRes.status} ${await postRes.text()}`);
-  }
+    const postBody = await postRes.text();
+    if (!postRes.ok) {
+      // Failed. Did another invocation (or an earlier attempt of ours) already create it?
+      const check = await fetch(
+        `https://bsky.social/xrpc/com.atproto.repo.getRecord?repo=${encodeURIComponent(did)}&collection=app.bsky.feed.post&rkey=${rkey}`,
+        { signal: AbortSignal.timeout(15_000) },
+      );
+      if (check.ok) {
+        console.log('DEDUPED: record already exists', rkey, 'original error:', postBody);
+        return 'deduped';
+      }
+      throw new Error(`Post failed: ${postRes.status} ${postBody}`);
+    }
+    const created = JSON.parse(postBody);
+    console.log('POST_CREATED', JSON.stringify({ uri: created.uri, cid: created.cid, rkey }));
+    return 'posted';
+	}
 
   if (dryRun) {
     console.log('--- DRY RUN: not posting to Bluesky, not saving state ---');
@@ -406,6 +471,7 @@ async function runBot(env, { dryRun = false } = {}) {
       filmInfo,
       postText,
       facets,
+	  rkey,
     };
   }
 
@@ -413,8 +479,10 @@ async function runBot(env, { dryRun = false } = {}) {
   let lastError;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      await postToBluesky();
-      console.log(`Posted: ${title}`);
+      const outcome = await postToBluesky();
+      console.log(outcome === 'deduped'
+        ? `Already posted by another invocation: ${title}`
+        : `Posted: ${title}`);
       lastError = null;
       break;
     } catch (e) {
