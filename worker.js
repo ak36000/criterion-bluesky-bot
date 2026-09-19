@@ -73,10 +73,16 @@ async function guessAndScrapeFilmPage(title) {
   const baseSlug = slugify(title);
   if (!baseSlug) return null;
 
-  const candidateSlugs = [baseSlug, `${baseSlug}-1`, `${baseSlug}-2`, `${baseSlug}-3`];
+  const candidateUrls = [
+    `https://www.criterionchannel.com/${baseSlug}`,
+    `https://www.criterionchannel.com/${baseSlug}-1`,
+    `https://www.criterionchannel.com/${baseSlug}-2`,
+    `https://www.criterionchannel.com/${baseSlug}-3`,
+    // Shorts and some other titles live under /videos/
+    `https://www.criterionchannel.com/videos/${baseSlug}`,
+  ];
 
-  for (const slug of candidateSlugs) {
-    const url = `https://www.criterionchannel.com/${slug}`;
+  for (const url of candidateUrls) {
     try {
       const res = await fetch(url, { signal: AbortSignal.timeout(15_000) });
       if (!res.ok) continue;
@@ -107,7 +113,7 @@ async function guessAndScrapeFilmPage(title) {
     }
   }
 
-  console.log(`No matching page found for "${title}" after trying ${candidateSlugs.length} candidate URL(s).`);
+  console.log(`No matching page found for "${title}" after trying ${candidateUrls.length} candidate URL(s).`);
   return null;
 }
 
@@ -127,6 +133,13 @@ export default {
   // *would* post, without touching KV state or Bluesky. Safe to hit anytime.
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+	const guessTitle = url.searchParams.get('guess');
+    if (guessTitle) {
+      const result = await guessAndScrapeFilmPage(guessTitle);
+      return new Response(JSON.stringify(result, null, 2), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
     if (url.searchParams.get('dryRun') === 'true') {
       const result = await runBot(env, { dryRun: true });
       if (!result) {
@@ -491,7 +504,21 @@ async function runBot(env, { dryRun = false, invocationId = 'manual', scheduledT
       if (attempt < 3) await new Promise(r => setTimeout(r, 10_000));
     }
   }
-  if (lastError) throw lastError;
+  if (lastError) {
+    // Every attempt failed. The schedule we saved earlier says "sleep until the
+    // next film", so undo that and retry on the next tick. lastTitle was never
+    // updated, so the next run will see this film as new and try again.
+    try {
+      await Promise.all([
+        KV.put('nextCheckAt', new Date(Date.now() + 60 * 1000).toISOString()),
+        KV.put('pollMode', 'waiting'),
+        KV.put('fastPollCount', '0'),
+      ]);
+    } catch (e) {
+      console.warn('Could not reset schedule after failure:', e.message);
+    }
+    throw lastError;
+  }
 
   // --- Persist new lastTitle ---
   await KV.put('lastTitle', title);
