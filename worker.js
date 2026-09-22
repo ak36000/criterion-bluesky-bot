@@ -117,6 +117,29 @@ async function guessAndScrapeFilmPage(title) {
   return null;
 }
 
+// Fetch or upload with one retry on timeout/network error. Only retries on
+// timeout/abort or a thrown network error — not on a clean non-2xx response,
+// since that's a server telling us something's wrong, not just slow.
+async function withRetry(label, attemptFn) {
+  const start = Date.now();
+  try {
+    return await attemptFn(30_000);
+  } catch (e) {
+    console.warn(`${label} failed on attempt 1 (${Date.now() - start}ms): ${e.message}. Retrying once...`);
+    await new Promise(r => setTimeout(r, 1_000));
+    const retryStart = Date.now();
+    try {
+      const result = await attemptFn(15_000);
+      console.log(`${label} succeeded on retry (${Date.now() - retryStart}ms).`);
+      return result;
+    } catch (e2) {
+      console.warn(`${label} failed on retry too (${Date.now() - retryStart}ms): ${e2.message}. Giving up on this step.`);
+      throw e2;
+    }
+  }
+}
+
+
 export default {
   async scheduled(event, env, ctx) {
     const invocationId = crypto.randomUUID().slice(0, 8);
@@ -393,44 +416,60 @@ async function runBot(env, { dryRun = false, invocationId = 'manual', scheduledT
     console.log('Logged in.');
 
     let embed;
-    if (imageUrl) {
-      try {
-        const imgRes = await fetch(imageUrl, { signal: AbortSignal.timeout(30_000) });
-        const imgBuffer = await imgRes.arrayBuffer();
-        const contentType = imgRes.headers.get('content-type') ?? 'image/jpeg';
+	if (imageUrl) {
+	  const imageStepStart = Date.now();
+	  let stage = 'starting';
+	  try {
+		stage = 'fetching image from imgix';
+		const fetchStart = Date.now();
+		const imgRes = await fetch(imageUrl, { signal: AbortSignal.timeout(30_000) });
+		console.log(`Image fetch: HTTP ${imgRes.status} in ${Date.now() - fetchStart}ms`);
 
-        const uploadRes = await fetch('https://bsky.social/xrpc/com.atproto.repo.uploadBlob', {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${accessJwt}`,
-            'Content-Type': contentType,
-          },
-          body: imgBuffer,
-          signal: AbortSignal.timeout(30_000),
-        });
+		if (!imgRes.ok) {
+		  console.warn(`Image fetch returned HTTP ${imgRes.status}, skipping image.`);
+		} else {
+		  stage = 'reading image bytes';
+		  const imgBuffer = await imgRes.arrayBuffer();
+		  const contentType = imgRes.headers.get('content-type') ?? 'image/jpeg';
+		  console.log(`Image downloaded: ${imgBuffer.byteLength} bytes (${contentType})`);
 
-        if (uploadRes.ok) {
-          const { blob } = await uploadRes.json();
+		  stage = 'uploading blob to Bluesky';
+		  const uploadStart = Date.now();
+		  const uploadRes = await fetch('https://bsky.social/xrpc/com.atproto.repo.uploadBlob', {
+			method: 'POST',
+			headers: {
+			  'Authorization': `Bearer ${accessJwt}`,
+			  'Content-Type': contentType,
+			},
+			body: imgBuffer,
+			signal: AbortSignal.timeout(30_000),
+		  });
+		  console.log(`Blob upload: HTTP ${uploadRes.status} in ${Date.now() - uploadStart}ms`);
 
-          // Parse width/height from URL params (e.g. w=1280&h=720) for correct aspect ratio
-          const imgUrlParams = new URL(imageUrl).searchParams;
-          const imgWidth = parseInt(imgUrlParams.get('w') ?? '0');
-          const imgHeight = parseInt(imgUrlParams.get('h') ?? '0');
-          const aspectRatio = (imgWidth && imgHeight)
-            ? { width: imgWidth, height: imgHeight }
-            : undefined;
+		  if (uploadRes.ok) {
+			stage = 'parsing upload response';
+			const { blob } = await uploadRes.json();
 
-          embed = {
-            $type: 'app.bsky.embed.images',
-            images: [{ image: blob, alt: `Film poster for ${title}`, aspectRatio }],
-          };
-        } else {
-          console.warn('Image upload failed:', await uploadRes.text());
-        }
-      } catch (e) {
-        console.warn('Image upload failed, posting without image:', e.message);
-      }
-    }
+			// Parse width/height from URL params (e.g. w=1280&h=720) for correct aspect ratio
+			const imgUrlParams = new URL(imageUrl).searchParams;
+			const imgWidth = parseInt(imgUrlParams.get('w') ?? '0');
+			const imgHeight = parseInt(imgUrlParams.get('h') ?? '0');
+			const aspectRatio = (imgWidth && imgHeight)
+			  ? { width: imgWidth, height: imgHeight }
+			  : undefined;
+
+			embed = {
+			  $type: 'app.bsky.embed.images',
+			  images: [{ image: blob, alt: `Film poster for ${title}`, aspectRatio }],
+			};
+		  } else {
+			console.warn('Blob upload failed:', await uploadRes.text());
+		  }
+		}
+	  } catch (e) {
+		console.warn(`Image step failed while ${stage} (${Date.now() - imageStepStart}ms elapsed): ${e.message}`);
+	  }
+	}
 
     const postRes = await fetch('https://bsky.social/xrpc/com.atproto.repo.createRecord', {
       method: 'POST',
