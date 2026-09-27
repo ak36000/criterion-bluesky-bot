@@ -27,6 +27,17 @@
 
 import * as cheerio from 'cheerio';
 
+// Plain `fetch()` from a Worker doesn't send the headers a real browser
+// would, and Criterion's redesign appears to reject that (the whatsonnow
+// request was coming back 403). Send a normal-looking browser UA/Accept on
+// every request to criterionchannel.com to match what worked when I checked
+// the site manually.
+const BROWSER_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+  'Accept-Language': 'en-US,en;q=0.9',
+};
+
 // The Criterion 24/7 channel's own page — used as the link when we can't
 // find a dedicated film page for whatever is currently playing.
 const GENERIC_LINK = 'https://www.criterionchannel.com/live/1emmgvqX/criterion-24-7';
@@ -120,7 +131,7 @@ function looksLikeName(text) {
 // `?filmpage=<url>` (see fetch handler below) after deploying, and tighten
 // it if either field doesn't show up correctly in the logs.
 async function scrapeFilmPage(url) {
-  const res = await fetch(url, { signal: AbortSignal.timeout(15_000) });
+  const res = await fetch(url, { headers: BROWSER_HEADERS, signal: AbortSignal.timeout(15_000) });
   if (!res.ok) throw new Error(`Film page fetch failed: HTTP ${res.status}`);
   const html = await res.text();
   const $film = cheerio.load(html);
@@ -268,14 +279,23 @@ async function runBot(env, { dryRun = false, invocationId = 'manual', scheduledT
   // 24/7" heading, and the dedicated film page is whichever <a> points into
   // /films/... (its visible label, e.g. "Film Page", isn't load-bearing —
   // matching on the href is more robust if Criterion tweaks the label).
-  const nowRes = await fetch('https://whatsonnow.criterionchannel.com/');
-  const nowHtml = await nowRes.text();
-  const $ = cheerio.load(nowHtml);
+  const nowRes = await fetch('https://whatsonnow.criterionchannel.com/', { headers: BROWSER_HEADERS });
 
-  const title = $('h1').first().text().trim();
-  const filmHref = $('a[href*="/films/"]').first().attr('href') || null;
-
-  console.log(`Now playing: ${title}`);
+  let title = '';
+  let filmHref = null;
+  if (!nowRes.ok) {
+    // Don't parse an error page's own <h1> ("403 Forbidden", "500 Internal
+    // Server Error", ...) as if it were a film title. Leave title empty —
+    // that's treated as "no title change" below, so the bot just retries
+    // on its normal poll schedule instead of posting garbage.
+    console.warn(`whatsonnow.criterionchannel.com returned HTTP ${nowRes.status}. Treating as no title change.`);
+  } else {
+    const nowHtml = await nowRes.text();
+    const $ = cheerio.load(nowHtml);
+    title = $('h1').first().text().trim();
+    filmHref = $('a[href*="/films/"]').first().attr('href') || null;
+    console.log(`Now playing: ${title}`);
+  }
 
   // --- Determine whether the film changed ---
   const titleChanged = title && title !== lastTitle;
