@@ -42,6 +42,14 @@ const BROWSER_HEADERS = {
 // find a dedicated film page for whatever is currently playing.
 const GENERIC_LINK = 'https://www.criterionchannel.com/live/1emmgvqX/criterion-24-7';
 
+// The whatsonnow page sometimes renders with its <h1> as the channel's own
+// branding instead of an actual film title — seen with no film link present
+// either, so it looks like a station-ID/bumper state (or a not-yet-resolved
+// server response) rather than a real "now playing" value. Treat these the
+// same as a fetch error: not a real title, don't post it, don't let it
+// clobber lastTitle.
+const PLACEHOLDER_TITLES = new Set(['Criterion 24/7', 'Criterion Channel']);
+
 function isGenericLink(href) {
   if (!href) return true;
   return href.replace(/\/$/, '') === GENERIC_LINK;
@@ -352,7 +360,14 @@ async function runBot(env, { dryRun = false, invocationId = 'manual', scheduledT
     // so resolve against the site root before this is used as a fetch() URL
     // or a Bluesky link facet.
     filmHref = filmHrefRaw ? new URL(filmHrefRaw, 'https://www.criterionchannel.com').toString() : null;
-    console.log(`Now playing: ${title}`);
+
+    if (PLACEHOLDER_TITLES.has(title)) {
+      console.warn(`whatsonnow.criterionchannel.com's <h1> was the channel's own branding ("${title}"), not a film title — likely a bumper/station-ID state, or the real content hadn't resolved server-side yet. Treating as no title change.`);
+      title = '';
+      filmHref = null;
+    } else {
+      console.log(`Now playing: ${title}`);
+    }
   }
 
   // --- Determine whether the film changed ---
