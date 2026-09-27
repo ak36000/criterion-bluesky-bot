@@ -120,27 +120,60 @@ function looksLikeName(text) {
   return /^[A-ZÀ-Ý][\p{L}.'-]*(?:\s+[A-ZÀ-Ý][\p{L}.'-]*){0,4}$/u.test(t);
 }
 
-// Scrape a dedicated film page (https://www.criterionchannel.com/films/...)
-// for the director, poster image, runtime, and cast list.
-//
-// None of this is based on confirmed class names (only cleaned/rendered
-// text), so it's positional: director and runtime are found by walking up
-// from the <h1> a couple of parent levels and checking each level's
-// previous sibling (director) or own text (runtime) against a recognizer.
-// That's a heuristic, not a confirmed selector — verify it with
-// `?filmpage=<url>` (see fetch handler below) after deploying, and tighten
-// it if either field doesn't show up correctly in the logs.
-async function scrapeFilmPage(url) {
-  const res = await fetch(url, { headers: BROWSER_HEADERS, signal: AbortSignal.timeout(15_000) });
-  if (!res.ok) throw new Error(`Film page fetch failed: HTTP ${res.status}`);
-  const html = await res.text();
-  const $film = cheerio.load(html);
+// Parse an ISO 8601 duration like "PT1H50M58S" into whole minutes (seconds
+// dropped, to match the "1 hr 50 min" the site shows users elsewhere).
+function parseISO8601DurationMinutes(iso) {
+  if (!iso) return null;
+  const m = iso.match(/^PT(?:(\d+)H)?(?:(\d+)M)?(?:\d+(?:\.\d+)?S)?$/i);
+  if (!m) return null;
+  const hours = m[1] ? parseInt(m[1], 10) : 0;
+  const minutes = m[2] ? parseInt(m[2], 10) : 0;
+  if (!hours && !minutes) return null;
+  return hours * 60 + minutes;
+}
 
-  const imageUrl = $film('meta[property="og:image"]').attr('content') ?? null;
+// Film pages embed schema.org JSON-LD for SEO (VideoObject/Movie), which
+// gives us exact director/cast/runtime with no guessing. This is the
+// primary data source; parseRuntimeMinutes/looksLikeName below are only a
+// fallback for if Criterion ever drops this markup.
+function extractFromJsonLd($doc) {
+  const nodes = [];
+  $doc('script[type="application/ld+json"]').each((_, el) => {
+    try {
+      const parsed = JSON.parse($doc(el).contents().text());
+      for (const item of Array.isArray(parsed) ? parsed : [parsed]) {
+        if (item && Array.isArray(item['@graph'])) nodes.push(...item['@graph']);
+        else if (item) nodes.push(item);
+      }
+    } catch {
+      // Malformed or non-JSON script tag matching the selector - ignore it.
+    }
+  });
 
+  const videoNode = nodes.find((n) => n && n['@type'] === 'VideoObject');
+  const movieNode = nodes.find((n) => n && n['@type'] === 'Movie');
+
+  const names = (value) => (Array.isArray(value) ? value : value ? [value] : [])
+    .map((p) => p?.name)
+    .filter(Boolean);
+
+  const director = names(videoNode?.director).join(', ');
+  const cast = names(movieNode?.actor ?? videoNode?.actor).join(', ');
+  const runtimeMinutes = parseISO8601DurationMinutes(movieNode?.duration ?? videoNode?.duration);
+
+  return { director, cast, runtimeMinutes };
+}
+
+// Positional fallback for when JSON-LD isn't present or is missing a field:
+// runtime and the unlabeled director name are found by walking up from the
+// <h1> a couple of parent levels; cast comes from the "Starring ..." text
+// run. None of this is based on confirmed class names (only cleaned/
+// rendered text) — verify it with `?filmpage=<url>` if it's ever actually
+// in use, and tighten it if a field doesn't show up correctly in the logs.
+function extractPositionally($doc) {
   let runtimeMinutes = null;
   let director = '';
-  let $scope = $film('h1').first();
+  let $scope = $doc('h1').first();
   for (let i = 0; i < 3 && $scope.length; i++) {
     if (runtimeMinutes === null) runtimeMinutes = parseRuntimeMinutes($scope.text());
     if (!director) {
@@ -151,16 +184,37 @@ async function scrapeFilmPage(url) {
     $scope = $scope.parent();
   }
 
-  // "Starring ..." still appears as its own text run, ending before the
-  // "Supplements" section (or one of a few other section labels, as a
-  // fallback boundary, or the end of the text as a last resort).
-  const bodyText = $film('body').text();
+  const bodyText = $doc('body').text();
   const starringMatch = bodyText.match(
-    /Starring\s+([^]*?)(?:\s*(?:Supplements|Categories|My List|Trailer|Commentary)\b|$)/i,
+    /Starring\s+([^]*?)(?:\s*(?:Supplements|Categories|My List|Trailer|Commentary)|$)/i,
   );
-  const starring = starringMatch ? `Starring ${starringMatch[1].trim()}` : '';
+  const filmInfo = [
+    director ? `Directed by ${director}` : '',
+    starringMatch ? `Starring ${starringMatch[1].trim()}` : '',
+  ].filter(Boolean).join('\n');
 
-  const filmInfo = [director ? `Directed by ${director}` : '', starring].filter(Boolean).join('\n');
+  return { runtimeMinutes, filmInfo };
+}
+
+// Scrape a dedicated film page (https://www.criterionchannel.com/films/...)
+// for the director, poster image, runtime, and cast list.
+async function scrapeFilmPage(url) {
+  const res = await fetch(url, { headers: BROWSER_HEADERS, signal: AbortSignal.timeout(15_000) });
+  if (!res.ok) throw new Error(`Film page fetch failed: HTTP ${res.status}`);
+  const html = await res.text();
+  const $film = cheerio.load(html);
+
+  const imageUrl = $film('meta[property="og:image"]').attr('content') ?? null;
+
+  const { director, cast, runtimeMinutes: jsonLdRuntime } = extractFromJsonLd($film);
+  let runtimeMinutes = jsonLdRuntime;
+  let filmInfo = [director ? `Directed by ${director}` : '', cast ? `Starring ${cast}` : ''].filter(Boolean).join('\n');
+
+  if (runtimeMinutes === null || !filmInfo) {
+    const fallback = extractPositionally($film);
+    if (runtimeMinutes === null) runtimeMinutes = fallback.runtimeMinutes;
+    if (!filmInfo) filmInfo = fallback.filmInfo;
+  }
 
   return { imageUrl, runtimeMinutes, filmInfo };
 }
