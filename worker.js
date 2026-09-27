@@ -9,29 +9,31 @@
  *   nextCheckAt    — ISO timestamp: don't do anything before this time
  *   pollMode       — "waiting" | "fast" | "slow"
  *   fastPollCount  — how many fast (1-min) polls have fired since film changed
+ *
+ * NOTE (2026-09): Criterion redesigned whatsonnow.criterionchannel.com and the
+ * film pages. The old scraper looked for an <a> with text "What's on now: ..."
+ * and an <a> with text "More", neither of which exist anymore, and film URLs
+ * changed from flat slugs (/the-film-title) to /films/{opaqueId}/{slug} —
+ * so slug-guessing is no longer possible. This version scrapes the new
+ * markup instead. The site also no longer exposes a "Next film starts in: X
+ * minutes" countdown in the static HTML (it looks like that's rendered
+ * client-side now), so we estimate it from the film's own runtime instead —
+ * see parseRuntimeMinutes() and the "starts around" post copy.
+ *
+ * Director is no longer labeled "Directed by ..." anywhere on the page, so
+ * scrapeFilmPage() finds it positionally (the unlabeled text right above the
+ * film's <h1>) rather than by a text marker — see looksLikeName().
  */
 
 import * as cheerio from 'cheerio';
 
-// The generic link Criterion falls back to when there's no dedicated film page.
-const GENERIC_LINK = 'https://www.criterionchannel.com/events/criterion-24-7';
+// The Criterion 24/7 channel's own page — used as the link when we can't
+// find a dedicated film page for whatever is currently playing.
+const GENERIC_LINK = 'https://www.criterionchannel.com/live/1emmgvqX/criterion-24-7';
 
 function isGenericLink(href) {
   if (!href) return true;
   return href.replace(/\/$/, '') === GENERIC_LINK;
-}
-
-// Criterion film page URLs are just the title, lowercased with any run of
-// punctuation/whitespace collapsed to a single hyphen -
-// e.g. "The Tit and the Moon" -> the-tit-and-the-moon
-//      "God's Country"        -> god-s-country   (apostrophe becomes a hyphen, not deleted)
-function slugify(str) {
-  return str
-    .normalize('NFKD')
-    .replace(/[\u0300-\u036f]/g, '')  // strip accents/diacritics
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')      // any run of non-alphanumeric chars -> one hyphen
-    .replace(/^-+|-+$/g, '');         // trim leading/trailing hyphens
 }
 
 // --- Deterministic record key, used to make duplicate posts impossible ---
@@ -61,60 +63,95 @@ function dedupeRkey(title, nowMs) {
   return makeTid(bucketMicros, hash10(title));
 }
 
-// Try to guess a film's Criterion Channel page from its title, and scrape
-// image + director/cast info from it, in the same shape the moreHref path
-// already produces (imageUrl, filmInfo as "Directed by ...\nStarring ...").
-// Some titles exist more than once in the catalog (reissues, different cuts),
-// where Criterion disambiguates with a "-1", "-2" suffix - so if the plain
-// slug doesn't resolve to a matching page, we try a few numbered variants
-// before giving up. Returns null if nothing confidently matches - callers
-// should treat that as "no extra info available" and continue gracefully.
-async function guessAndScrapeFilmPage(title) {
-  const baseSlug = slugify(title);
-  if (!baseSlug) return null;
+// Parse a runtime out of text like "1 hr 50 min" or "50 min". Criterion's
+// film pages render the release year glued directly to the front of this
+// string with no separator (e.g. a 2000 release that runs 1hr50 shows up in
+// scraped text as "20001 hr 50 min"), so we strip a plausible leading year
+// before parsing the numbers. We only strip when the digit run is long
+// enough that it couldn't just be a real runtime (>=5 digits), so a lone
+// "20 min" short isn't mistaken for a bare year.
+function parseRuntimeMinutes(rawText) {
+  if (!rawText) return null;
+  const stripYear = (digits) => (digits.length >= 5 ? digits.replace(/^(19|20)\d{2}/, '') : digits);
 
-  const candidateUrls = [
-    `https://www.criterionchannel.com/${baseSlug}`,
-    `https://www.criterionchannel.com/${baseSlug}-1`,
-    `https://www.criterionchannel.com/${baseSlug}-2`,
-    `https://www.criterionchannel.com/${baseSlug}-3`,
-    // Shorts and some other titles live under /videos/
-    `https://www.criterionchannel.com/videos/${baseSlug}`,
-  ];
-
-  for (const url of candidateUrls) {
-    try {
-      const res = await fetch(url, { signal: AbortSignal.timeout(15_000) });
-      if (!res.ok) continue;
-
-      const html = await res.text();
-      const $page = cheerio.load(html);
-
-      // Sanity check: make sure the guessed page is actually about this film,
-      // not a 404 that returns 200, a redirect to the homepage, etc.
-      const ogTitle = $page('meta[property="og:title"]').attr('content') ?? '';
-      const cleanOgTitle = ogTitle.replace(/\s*-\s*The Criterion Channel\s*$/i, '').trim().toLowerCase();
-      if (cleanOgTitle !== title.trim().toLowerCase()) {
-        console.log(`Guessed URL ${url} didn't match ("${ogTitle}"), trying next candidate...`);
-        continue;
-      }
-
-      const imageUrl = $page('meta[property="og:image"]').attr('content') ?? null;
-      const desc = $page('meta[property="og:description"]').attr('content') ?? '';
-      const descLines = desc.split('\n').map(l => l.trim()).filter(Boolean);
-      const dirLine = descLines.find(l => /^Directed by /i.test(l)) ?? '';
-      const starLine = descLines.find(l => /^Starring /i.test(l)) ?? '';
-      const filmInfo = [dirLine, starLine].filter(Boolean).join('\n');
-
-      return { filmLink: url, imageUrl, filmInfo };
-    } catch (e) {
-      console.warn(`Guess-and-scrape failed for ${url}:`, e.message);
-      // fall through and try the next candidate
-    }
+  let m = rawText.match(/(\d+)\s*hr\s*(\d{1,2})\s*min/i);
+  if (m) {
+    const hours = parseInt(stripYear(m[1]), 10);
+    const minutes = parseInt(m[2], 10);
+    if (!Number.isNaN(hours) && !Number.isNaN(minutes)) return hours * 60 + minutes;
   }
 
-  console.log(`No matching page found for "${title}" after trying ${candidateUrls.length} candidate URL(s).`);
+  m = rawText.match(/(\d+)\s*hr\b/i);
+  if (m) {
+    const hours = parseInt(stripYear(m[1]), 10);
+    if (!Number.isNaN(hours)) return hours * 60;
+  }
+
+  m = rawText.match(/(\d+)\s*min\b/i);
+  if (m) {
+    const minutes = parseInt(stripYear(m[1]), 10);
+    if (!Number.isNaN(minutes)) return minutes;
+  }
+
   return null;
+}
+
+// A crude "does this look like a person's name, not nav/boilerplate text"
+// check, used when we're pulling text based on its position on the page
+// rather than a label. Rejects anything too long, empty, or obviously not
+// name-shaped (full sentences, nav links, etc).
+function looksLikeName(text) {
+  if (!text) return false;
+  const t = text.trim();
+  if (!t || t.length > 60) return false;
+  if (/^(home|new|all films|subscribe|log in|search|criterion|watch|details|account)\b/i.test(t)) return false;
+  // Expect 1-5 capitalized words, e.g. "Karyn Kusama" or "Jean-Luc Godard".
+  return /^[A-ZÀ-Ý][\p{L}.'-]*(?:\s+[A-ZÀ-Ý][\p{L}.'-]*){0,4}$/u.test(t);
+}
+
+// Scrape a dedicated film page (https://www.criterionchannel.com/films/...)
+// for the director, poster image, runtime, and cast list.
+//
+// None of this is based on confirmed class names (only cleaned/rendered
+// text), so it's positional: director and runtime are found by walking up
+// from the <h1> a couple of parent levels and checking each level's
+// previous sibling (director) or own text (runtime) against a recognizer.
+// That's a heuristic, not a confirmed selector — verify it with
+// `?filmpage=<url>` (see fetch handler below) after deploying, and tighten
+// it if either field doesn't show up correctly in the logs.
+async function scrapeFilmPage(url) {
+  const res = await fetch(url, { signal: AbortSignal.timeout(15_000) });
+  if (!res.ok) throw new Error(`Film page fetch failed: HTTP ${res.status}`);
+  const html = await res.text();
+  const $film = cheerio.load(html);
+
+  const imageUrl = $film('meta[property="og:image"]').attr('content') ?? null;
+
+  let runtimeMinutes = null;
+  let director = '';
+  let $scope = $film('h1').first();
+  for (let i = 0; i < 3 && $scope.length; i++) {
+    if (runtimeMinutes === null) runtimeMinutes = parseRuntimeMinutes($scope.text());
+    if (!director) {
+      const prevText = $scope.prev().text().trim();
+      if (looksLikeName(prevText)) director = prevText;
+    }
+    if (runtimeMinutes !== null && director) break;
+    $scope = $scope.parent();
+  }
+
+  // "Starring ..." still appears as its own text run, ending before the
+  // "Supplements" section (or one of a few other section labels, as a
+  // fallback boundary, or the end of the text as a last resort).
+  const bodyText = $film('body').text();
+  const starringMatch = bodyText.match(
+    /Starring\s+([^]*?)(?:\s*(?:Supplements|Categories|My List|Trailer|Commentary)\b|$)/i,
+  );
+  const starring = starringMatch ? `Starring ${starringMatch[1].trim()}` : '';
+
+  const filmInfo = [director ? `Directed by ${director}` : '', starring].filter(Boolean).join('\n');
+
+  return { imageUrl, runtimeMinutes, filmInfo };
 }
 
 // Fetch or upload with one retry on timeout/network error. Only retries on
@@ -151,17 +188,27 @@ export default {
     ctx.waitUntil(runBot(env, { invocationId, scheduledTime: event.scheduledTime }));
   },
 
-  // Manual HTTP trigger, for testing only. Visiting the worker's URL with
-  // ?dryRun=true runs the full scrape/guess pipeline and returns what it
-  // *would* post, without touching KV state or Bluesky. Safe to hit anytime.
+  // Manual HTTP triggers, for testing only.
+  //   ?dryRun=true        — run the full pipeline and return what it *would*
+  //                         post, without touching KV state or Bluesky.
+  //   ?filmpage=<url>     — scrape a single film page directly, to verify
+  //                         runtime/cast extraction against real Criterion
+  //                         markup without waiting for a live transition.
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-	const guessTitle = url.searchParams.get('guess');
-    if (guessTitle) {
-      const result = await guessAndScrapeFilmPage(guessTitle);
-      return new Response(JSON.stringify(result, null, 2), {
-        headers: { 'Content-Type': 'application/json' },
-      });
+    const filmPageUrl = url.searchParams.get('filmpage');
+    if (filmPageUrl) {
+      try {
+        const result = await scrapeFilmPage(filmPageUrl);
+        return new Response(JSON.stringify(result, null, 2), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      } catch (e) {
+        return new Response(JSON.stringify({ error: e.message }, null, 2), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
     }
     if (url.searchParams.get('dryRun') === 'true') {
       const result = await runBot(env, { dryRun: true });
@@ -200,8 +247,8 @@ async function runBot(env, { dryRun = false, invocationId = 'manual', scheduledT
   const now = Date.now();
   const nextCheckAt = nextCheckAtStr ? new Date(nextCheckAtStr).getTime() : 0;
   const fastPollCount = fastPollCountStr ? parseInt(fastPollCountStr) : 0;
-  
-    console.log('STATE_READ', JSON.stringify({
+
+  console.log('STATE_READ', JSON.stringify({
     lastTitle, nextCheckAtStr, pollMode, fastPollCountStr,
     now: new Date(now).toISOString(),
     scheduledTime: scheduledTime ? new Date(scheduledTime).toISOString() : null,
@@ -217,50 +264,66 @@ async function runBot(env, { dryRun = false, invocationId = 'manual', scheduledT
   }
 
   // --- Scrape What's On Now ---
+  // New markup: the title is a plain <h1> under a "Now Playing On Criterion
+  // 24/7" heading, and the dedicated film page is whichever <a> points into
+  // /films/... (its visible label, e.g. "Film Page", isn't load-bearing —
+  // matching on the href is more robust if Criterion tweaks the label).
   const nowRes = await fetch('https://whatsonnow.criterionchannel.com/');
   const nowHtml = await nowRes.text();
   const $ = cheerio.load(nowHtml);
 
-  const moreHref = $('a')
-    .filter((_, el) => $(el).text().trim() === 'More')
-    .first()
-    .attr('href');
-
-  const nowText = $('a')
-    .filter((_, el) => /what'?s on now/i.test($(el).text()))
-    .first()
-    .text()
-    .trim();
-  let title = nowText.replace(/^What'?s on now:\s*/i, '').trim();
-
-  if (!title && moreHref) {
-    const slug = moreHref.replace(/.*criterionchannel\.com\//, '');
-    title = slug.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-  }
-
-  const nextRaw = $('body').text().match(/Next film starts in:\s*(\d+)\s*minute/i)?.[1];
-  const minutesUntilNext = nextRaw ? parseInt(nextRaw) : null;
+  const title = $('h1').first().text().trim();
+  const filmHref = $('a[href*="/films/"]').first().attr('href') || null;
 
   console.log(`Now playing: ${title}`);
-  console.log(`Minutes until next: ${minutesUntilNext ?? 'unknown'}`);
 
-  // --- Determine next check time and poll mode ---
+  // --- Determine whether the film changed ---
   const titleChanged = title && title !== lastTitle;
 
+  // --- If the film changed, scrape its page now so we have runtime info
+  // available both for the schedule below and for the post text later. ---
+  let imageUrl = null;
+  let filmInfo = '';
+  let filmLink = GENERIC_LINK;
+  let runtimeMinutes = null;
+
+  if (titleChanged) {
+    if (filmHref && !isGenericLink(filmHref)) {
+      filmLink = filmHref;
+      try {
+        const scraped = await scrapeFilmPage(filmHref);
+        imageUrl = scraped.imageUrl;
+        filmInfo = scraped.filmInfo;
+        runtimeMinutes = scraped.runtimeMinutes;
+        console.log(`Film page: ${filmHref}`);
+        console.log(`Image URL: ${imageUrl}`);
+        console.log(`Runtime: ${runtimeMinutes ?? 'unknown'} min`);
+        console.log(`Film info: ${filmInfo}`);
+      } catch (e) {
+        console.warn('Could not fetch/parse film page:', e.message);
+      }
+    } else {
+      console.log('No dedicated film link found on the live page; posting without extra metadata.');
+    }
+  }
+
+  // --- Determine next check time and poll mode ---
   let newPollMode = pollMode ?? 'waiting';
   let newFastPollCount = fastPollCount;
   let nextCheckMs;
 
   if (titleChanged) {
-    // New film detected — reset to "waiting" mode using site's own countdown
+    // New film detected — reset to "waiting" mode. We no longer get a
+    // live countdown from the site, so we estimate the sleep from the
+    // film's own runtime (assuming "now" is close to when it started,
+    // which fast/slow polling below is meant to guarantee).
     newPollMode = 'waiting';
     newFastPollCount = 0;
-    if (minutesUntilNext !== null && minutesUntilNext > 1) {
-      // Wake up 1 minute before the next film is due
-      nextCheckMs = now + (minutesUntilNext - 1) * 60 * 1000;
-      console.log(`New film posted. Sleeping for ${minutesUntilNext - 1} minutes.`);
+    if (runtimeMinutes !== null && runtimeMinutes > 1) {
+      nextCheckMs = now + (runtimeMinutes - 1) * 60 * 1000;
+      console.log(`New film posted. Sleeping ~${runtimeMinutes - 1} minutes (estimated from runtime).`);
     } else {
-      // Site doesn't know, check again in 5 minutes
+      // Couldn't determine a runtime — check again in 5 minutes.
       nextCheckMs = now + 5 * 60 * 1000;
     }
   } else {
@@ -307,56 +370,16 @@ async function runBot(env, { dryRun = false, invocationId = 'manual', scheduledT
   }
 
   // --- Build the post text ---
+  // We're estimating this from runtime rather than reading it off the site,
+  // so the copy says "starts around" instead of "starts in".
   let nextText = 'unknown';
-  if (minutesUntilNext !== null) {
-    const nextTime = new Date(now + minutesUntilNext * 60 * 1000);
+  if (runtimeMinutes !== null) {
+    const nextTime = new Date(now + runtimeMinutes * 60 * 1000);
     const etTime = nextTime.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: 'America/New_York' });
     const ptTime = nextTime.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: 'America/Los_Angeles' });
     const etZone = nextTime.toLocaleDateString('en-US', { timeZone: 'America/New_York', timeZoneName: 'short' }).split(', ')[1] ?? 'ET';
     const ptZone = nextTime.toLocaleDateString('en-US', { timeZone: 'America/Los_Angeles', timeZoneName: 'short' }).split(', ')[1] ?? 'PT';
-    nextText = `${minutesUntilNext} minutes (${etTime} ${etZone}/${ptTime} ${ptZone})`;
-  }
-
-  // --- Fetch og:image / director / cast ---
-  let imageUrl = null;
-  let filmInfo = '';
-  let filmLink = moreHref ?? GENERIC_LINK;
-  let usedGuessedPage = false;
-
-  if (moreHref && !isGenericLink(moreHref)) {
-    // Normal case: Criterion gave us a real, dedicated film link.
-    try {
-      const filmRes = await fetch(moreHref, { signal: AbortSignal.timeout(15_000) });
-      const filmHtml = await filmRes.text();
-      const $film = cheerio.load(filmHtml);
-      imageUrl = $film('meta[property="og:image"]').attr('content') ?? null;
-      console.log(`Image URL: ${imageUrl}`);
-
-      // Extract director/year/country and cast from og:description
-      const desc = $film('meta[property="og:description"]').attr('content') ?? '';
-      const descLines = desc.split('\n').map(l => l.trim()).filter(Boolean);
-      const dirLine = descLines.find(l => /^Directed by /i.test(l)) ?? '';
-      const starLine = descLines.find(l => /^Starring /i.test(l)) ?? '';
-      filmInfo = [dirLine, starLine].filter(Boolean).join('\n');
-      console.log(`Film info: ${filmInfo}`);
-    } catch (e) {
-      console.warn('Could not fetch film page:', e.message);
-    }
-  } else {
-    // No dedicated film link on the page - try guessing the URL from the title.
-    console.log('No dedicated film link found; attempting to guess the film page URL...');
-    const scraped = await guessAndScrapeFilmPage(title);
-    if (scraped) {
-      console.log(`Guessed film page: ${scraped.filmLink}`);
-      console.log(`Image URL: ${scraped.imageUrl}`);
-      console.log(`Film info: ${scraped.filmInfo}`);
-      imageUrl = scraped.imageUrl;
-      filmInfo = scraped.filmInfo;
-      filmLink = scraped.filmLink;
-      usedGuessedPage = true;
-    } else {
-      console.log('Could not confirm a guessed film page; posting without extra metadata.');
-    }
+    nextText = `${runtimeMinutes} minutes (${etTime} ${etZone}/${ptTime} ${ptZone})`;
   }
 
   const linkText = 'Watch on Criterion Channel';
@@ -369,22 +392,22 @@ async function runBot(env, { dryRun = false, invocationId = 'manual', scheduledT
     const lines = info.split('\n');
     // Try both lines
     if ([...info].length <= budget) return info;
-    // Try just the directed-by line
+    // Try just the first line
     if (lines.length > 1 && [...lines[0]].length <= budget) return lines[0];
     // Last resort: truncate with ellipsis
     return [...lines[0]].slice(0, budget - 1).join('') + '…';
   }
 
   // Calculate budget: measure the base post (without filmInfo) and see what's left
-  const basePost = `🎬 Now streaming on Criterion Channel 24/7:\n\n${title}\n\nNext film starts in: ${nextText}\n\n${linkText}`;
+  const basePost = `🎬 Now streaming on Criterion Channel 24/7:\n\n${title}\n\nNext film starts around: ${nextText}\n\n${linkText}`;
   const baseCost = [...basePost].length;
   const filmInfoBudget = Math.max(0, BSKY_LIMIT - baseCost - 1); // -1 for the extra \n separator
 
   const filmInfoTrimmed = truncateFilmInfo(filmInfo, filmInfoBudget);
   const postText = filmInfoTrimmed
-    ? `🎬 Now streaming on Criterion Channel 24/7:\n\n${title}\n${filmInfoTrimmed}\n\nNext film starts in: ${nextText}\n\n${linkText}`
+    ? `🎬 Now streaming on Criterion Channel 24/7:\n\n${title}\n${filmInfoTrimmed}\n\nNext film starts around: ${nextText}\n\n${linkText}`
     : basePost;
-	
+
   const encoder = new TextEncoder();
   const beforeLink = postText.slice(0, postText.lastIndexOf(linkText));
   const byteStart = encoder.encode(beforeLink).length;
@@ -397,7 +420,7 @@ async function runBot(env, { dryRun = false, invocationId = 'manual', scheduledT
 
   const rkey = dedupeRkey(title, now);
   console.log('RKEY', rkey);
- 
+
   // --- Post to Bluesky ---
   async function postToBluesky() {
     console.log('Logging in to Bluesky...');
@@ -416,60 +439,60 @@ async function runBot(env, { dryRun = false, invocationId = 'manual', scheduledT
     console.log('Logged in.');
 
     let embed;
-	if (imageUrl) {
-	  const imageStepStart = Date.now();
-	  let stage = 'starting';
-	  try {
-		stage = 'fetching image from imgix';
-		const fetchStart = Date.now();
-		const imgRes = await fetch(imageUrl, { signal: AbortSignal.timeout(30_000) });
-		console.log(`Image fetch: HTTP ${imgRes.status} in ${Date.now() - fetchStart}ms`);
+    if (imageUrl) {
+      const imageStepStart = Date.now();
+      let stage = 'starting';
+      try {
+        stage = 'fetching image from imgix';
+        const fetchStart = Date.now();
+        const imgRes = await fetch(imageUrl, { signal: AbortSignal.timeout(30_000) });
+        console.log(`Image fetch: HTTP ${imgRes.status} in ${Date.now() - fetchStart}ms`);
 
-		if (!imgRes.ok) {
-		  console.warn(`Image fetch returned HTTP ${imgRes.status}, skipping image.`);
-		} else {
-		  stage = 'reading image bytes';
-		  const imgBuffer = await imgRes.arrayBuffer();
-		  const contentType = imgRes.headers.get('content-type') ?? 'image/jpeg';
-		  console.log(`Image downloaded: ${imgBuffer.byteLength} bytes (${contentType})`);
+        if (!imgRes.ok) {
+          console.warn(`Image fetch returned HTTP ${imgRes.status}, skipping image.`);
+        } else {
+          stage = 'reading image bytes';
+          const imgBuffer = await imgRes.arrayBuffer();
+          const contentType = imgRes.headers.get('content-type') ?? 'image/jpeg';
+          console.log(`Image downloaded: ${imgBuffer.byteLength} bytes (${contentType})`);
 
-		  stage = 'uploading blob to Bluesky';
-		  const uploadStart = Date.now();
-		  const uploadRes = await fetch('https://bsky.social/xrpc/com.atproto.repo.uploadBlob', {
-			method: 'POST',
-			headers: {
-			  'Authorization': `Bearer ${accessJwt}`,
-			  'Content-Type': contentType,
-			},
-			body: imgBuffer,
-			signal: AbortSignal.timeout(30_000),
-		  });
-		  console.log(`Blob upload: HTTP ${uploadRes.status} in ${Date.now() - uploadStart}ms`);
+          stage = 'uploading blob to Bluesky';
+          const uploadStart = Date.now();
+          const uploadRes = await fetch('https://bsky.social/xrpc/com.atproto.repo.uploadBlob', {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${accessJwt}`,
+              'Content-Type': contentType,
+            },
+            body: imgBuffer,
+            signal: AbortSignal.timeout(30_000),
+          });
+          console.log(`Blob upload: HTTP ${uploadRes.status} in ${Date.now() - uploadStart}ms`);
 
-		  if (uploadRes.ok) {
-			stage = 'parsing upload response';
-			const { blob } = await uploadRes.json();
+          if (uploadRes.ok) {
+            stage = 'parsing upload response';
+            const { blob } = await uploadRes.json();
 
-			// Parse width/height from URL params (e.g. w=1280&h=720) for correct aspect ratio
-			const imgUrlParams = new URL(imageUrl).searchParams;
-			const imgWidth = parseInt(imgUrlParams.get('w') ?? '0');
-			const imgHeight = parseInt(imgUrlParams.get('h') ?? '0');
-			const aspectRatio = (imgWidth && imgHeight)
-			  ? { width: imgWidth, height: imgHeight }
-			  : undefined;
+            // Parse width/height from URL params (e.g. w=1280&h=720) for correct aspect ratio
+            const imgUrlParams = new URL(imageUrl).searchParams;
+            const imgWidth = parseInt(imgUrlParams.get('w') ?? '0');
+            const imgHeight = parseInt(imgUrlParams.get('h') ?? '0');
+            const aspectRatio = (imgWidth && imgHeight)
+              ? { width: imgWidth, height: imgHeight }
+              : undefined;
 
-			embed = {
-			  $type: 'app.bsky.embed.images',
-			  images: [{ image: blob, alt: `Film poster for ${title}`, aspectRatio }],
-			};
-		  } else {
-			console.warn('Blob upload failed:', await uploadRes.text());
-		  }
-		}
-	  } catch (e) {
-		console.warn(`Image step failed while ${stage} (${Date.now() - imageStepStart}ms elapsed): ${e.message}`);
-	  }
-	}
+            embed = {
+              $type: 'app.bsky.embed.images',
+              images: [{ image: blob, alt: `Film poster for ${title}`, aspectRatio }],
+            };
+          } else {
+            console.warn('Blob upload failed:', await uploadRes.text());
+          }
+        }
+      } catch (e) {
+        console.warn(`Image step failed while ${stage} (${Date.now() - imageStepStart}ms elapsed): ${e.message}`);
+      }
+    }
 
     const postRes = await fetch('https://bsky.social/xrpc/com.atproto.repo.createRecord', {
       method: 'POST',
@@ -480,7 +503,7 @@ async function runBot(env, { dryRun = false, invocationId = 'manual', scheduledT
       body: JSON.stringify({
         repo: did,
         collection: 'app.bsky.feed.post',
-		rkey,
+        rkey,
         record: {
           $type: 'app.bsky.feed.post',
           text: postText,
@@ -508,7 +531,7 @@ async function runBot(env, { dryRun = false, invocationId = 'manual', scheduledT
     const created = JSON.parse(postBody);
     console.log('POST_CREATED', JSON.stringify({ uri: created.uri, cid: created.cid, rkey }));
     return 'posted';
-	}
+  }
 
   if (dryRun) {
     console.log('--- DRY RUN: not posting to Bluesky, not saving state ---');
@@ -516,14 +539,14 @@ async function runBot(env, { dryRun = false, invocationId = 'manual', scheduledT
       dryRun: true,
       title,
       titleChanged,
-      moreHref,
-      usedGuessedPage,
+      filmHref,
       filmLink,
       imageUrl,
+      runtimeMinutes,
       filmInfo,
       postText,
       facets,
-	  rkey,
+      rkey,
     };
   }
 
