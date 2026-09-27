@@ -293,7 +293,11 @@ async function runBot(env, { dryRun = false, invocationId = 'manual', scheduledT
     const nowHtml = await nowRes.text();
     const $ = cheerio.load(nowHtml);
     title = $('h1').first().text().trim();
-    filmHref = $('a[href*="/films/"]').first().attr('href') || null;
+    const filmHrefRaw = $('a[href*="/films/"]').first().attr('href') || null;
+    // The site's anchors use relative hrefs (e.g. "/films/Uf2lft9k/girlfight"),
+    // so resolve against the site root before this is used as a fetch() URL
+    // or a Bluesky link facet.
+    filmHref = filmHrefRaw ? new URL(filmHrefRaw, 'https://www.criterionchannel.com').toString() : null;
     console.log(`Now playing: ${title}`);
   }
 
