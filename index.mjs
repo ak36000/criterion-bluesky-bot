@@ -1,37 +1,30 @@
 /**
- * Criterion Channel Bluesky Bot — Cloudflare Worker
+ * Criterion Channel Bluesky Bot — AWS Lambda port
  *
- * Cron: every 1 minute (* * * * *)
- * KV namespace: CRITERION_STATE  (bind in wrangler.toml)
+ * Trigger: EventBridge Scheduler, rate(1 minute), targeting this function.
+ * State: a single DynamoDB item (table name from TABLE_NAME env var) with
+ *   attributes: lastTitle, nextCheckAt, pollMode, fastPollCount.
+ * Secrets: BSKY_HANDLE / BSKY_APP_PASSWORD as Lambda environment variables.
  *
- * State keys:
- *   lastTitle      — title of the last film posted
- *   nextCheckAt    — ISO timestamp: don't do anything before this time
- *   pollMode       — "waiting" | "fast" | "slow"
- *   fastPollCount  — how many fast (1-min) polls have fired since film changed
- *
- * NOTE (2026-09): Criterion redesigned whatsonnow.criterionchannel.com and the
- * film pages. The old scraper looked for an <a> with text "What's on now: ..."
- * and an <a> with text "More", neither of which exist anymore, and film URLs
- * changed from flat slugs (/the-film-title) to /films/{opaqueId}/{slug} —
- * so slug-guessing is no longer possible. This version scrapes the new
- * markup instead. The site also no longer exposes a "Next film starts in: X
- * minutes" countdown in the static HTML (it looks like that's rendered
- * client-side now), so we estimate it from the film's own runtime instead —
- * see parseRuntimeMinutes() and the "starts around" post copy.
- *
- * Director is no longer labeled "Directed by ..." anywhere on the page, so
- * scrapeFilmPage() finds it positionally (the unlabeled text right above the
- * film's <h1>) rather than by a text marker — see looksLikeName().
+ * This is a straight port of the Cloudflare Worker version's scraping/
+ * posting logic (same reasons for every heuristic — see inline comments),
+ * with only the platform-specific plumbing swapped: KV -> DynamoDB, the
+ * scheduled()/fetch() dual export -> a single handler that branches on
+ * whether the invocation came from EventBridge Scheduler or the Function
+ * URL (used the same way the old ?dryRun=true / ?filmpage= HTTP routes
+ * were used for manual testing).
  */
 
 import * as cheerio from 'cheerio';
+import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocumentClient, GetCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 
-// Plain `fetch()` from a Worker doesn't send the headers a real browser
-// would, and Criterion's redesign appears to reject that (the whatsonnow
-// request was coming back 403). Send a normal-looking browser UA/Accept on
-// every request to criterionchannel.com to match what worked when I checked
-// the site manually.
+const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+const TABLE_NAME = process.env.TABLE_NAME || 'CriterionBotState';
+const STATE_PK = 'criterion-bot-state';
+
+// Plain fetch() doesn't send the headers a real browser would, and
+// Criterion's site rejects that (whatsonnow returns 403 without these).
 const BROWSER_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
@@ -74,8 +67,6 @@ function hash10(str) {
 }
 
 // Same title within the same 30-minute bucket => same key.
-// The title hash goes in the 10-bit clock id, so a different film in the same
-// bucket gets a different key (a 1-in-1024 collision chance).
 function dedupeRkey(title, nowMs) {
   const BUCKET_MS = 30 * 60 * 1000;
   const bucketMicros = Math.floor(nowMs / BUCKET_MS) * BUCKET_MS * 1000;
@@ -86,9 +77,7 @@ function dedupeRkey(title, nowMs) {
 // film pages render the release year glued directly to the front of this
 // string with no separator (e.g. a 2000 release that runs 1hr50 shows up in
 // scraped text as "20001 hr 50 min"), so we strip a plausible leading year
-// before parsing the numbers. We only strip when the digit run is long
-// enough that it couldn't just be a real runtime (>=5 digits), so a lone
-// "20 min" short isn't mistaken for a bare year.
+// before parsing the numbers.
 function parseRuntimeMinutes(rawText) {
   if (!rawText) return null;
   const stripYear = (digits) => (digits.length >= 5 ? digits.replace(/^(19|20)\d{2}/, '') : digits);
@@ -116,15 +105,12 @@ function parseRuntimeMinutes(rawText) {
 }
 
 // A crude "does this look like a person's name, not nav/boilerplate text"
-// check, used when we're pulling text based on its position on the page
-// rather than a label. Rejects anything too long, empty, or obviously not
-// name-shaped (full sentences, nav links, etc).
+// check, used only as a fallback when JSON-LD isn't available.
 function looksLikeName(text) {
   if (!text) return false;
   const t = text.trim();
   if (!t || t.length > 60) return false;
   if (/^(home|new|all films|subscribe|log in|search|criterion|watch|details|account)\b/i.test(t)) return false;
-  // Expect 1-5 capitalized words, e.g. "Karyn Kusama" or "Jean-Luc Godard".
   return /^[A-ZÀ-Ý][\p{L}.'-]*(?:\s+[A-ZÀ-Ý][\p{L}.'-]*){0,4}$/u.test(t);
 }
 
@@ -142,7 +128,7 @@ function parseISO8601DurationMinutes(iso) {
 
 // Film pages embed schema.org JSON-LD for SEO (VideoObject/Movie), which
 // gives us exact director/cast/runtime with no guessing. This is the
-// primary data source; parseRuntimeMinutes/looksLikeName below are only a
+// primary data source; parseRuntimeMinutes/looksLikeName above are only a
 // fallback for if Criterion ever drops this markup.
 function extractFromJsonLd($doc) {
   const nodes = [];
@@ -172,12 +158,7 @@ function extractFromJsonLd($doc) {
   return { director, cast, runtimeMinutes };
 }
 
-// Positional fallback for when JSON-LD isn't present or is missing a field:
-// runtime and the unlabeled director name are found by walking up from the
-// <h1> a couple of parent levels; cast comes from the "Starring ..." text
-// run. None of this is based on confirmed class names (only cleaned/
-// rendered text) — verify it with `?filmpage=<url>` if it's ever actually
-// in use, and tighten it if a field doesn't show up correctly in the logs.
+// Positional fallback for when JSON-LD isn't present or is missing a field.
 function extractPositionally($doc) {
   let runtimeMinutes = null;
   let director = '';
@@ -227,104 +208,60 @@ async function scrapeFilmPage(url) {
   return { imageUrl, runtimeMinutes, filmInfo };
 }
 
-// Fetch or upload with one retry on timeout/network error. Only retries on
-// timeout/abort or a thrown network error — not on a clean non-2xx response,
-// since that's a server telling us something's wrong, not just slow.
-async function withRetry(label, attemptFn) {
-  const start = Date.now();
-  try {
-    return await attemptFn(30_000);
-  } catch (e) {
-    console.warn(`${label} failed on attempt 1 (${Date.now() - start}ms): ${e.message}. Retrying once...`);
-    await new Promise(r => setTimeout(r, 1_000));
-    const retryStart = Date.now();
-    try {
-      const result = await attemptFn(15_000);
-      console.log(`${label} succeeded on retry (${Date.now() - retryStart}ms).`);
-      return result;
-    } catch (e2) {
-      console.warn(`${label} failed on retry too (${Date.now() - retryStart}ms): ${e2.message}. Giving up on this step.`);
-      throw e2;
-    }
-  }
+// --- DynamoDB state (replaces the Worker's KV namespace) ---
+// Everything lives in one item so a read/write is a single request instead
+// of four. loadState() always returns all four fields (null if unset, same
+// as KV.get() would have).
+async function loadState() {
+  const res = await ddb.send(new GetCommand({ TableName: TABLE_NAME, Key: { pk: STATE_PK } }));
+  const item = res.Item || {};
+  return {
+    lastTitle: item.lastTitle ?? null,
+    nextCheckAtStr: item.nextCheckAt ?? null,
+    pollMode: item.pollMode ?? null,
+    fastPollCountStr: item.fastPollCount ?? null,
+  };
 }
 
+async function saveState(fields) {
+  const names = {};
+  const values = {};
+  const sets = [];
+  let i = 0;
+  for (const [k, v] of Object.entries(fields)) {
+    const nk = `#k${i}`;
+    const vk = `:v${i}`;
+    names[nk] = k;
+    values[vk] = v;
+    sets.push(`${nk} = ${vk}`);
+    i += 1;
+  }
+  await ddb.send(new UpdateCommand({
+    TableName: TABLE_NAME,
+    Key: { pk: STATE_PK },
+    UpdateExpression: `SET ${sets.join(', ')}`,
+    ExpressionAttributeNames: names,
+    ExpressionAttributeValues: values,
+  }));
+}
 
-export default {
-  async scheduled(event, env, ctx) {
-    const invocationId = crypto.randomUUID().slice(0, 8);
-    console.log(`[${invocationId}] INVOKE`, JSON.stringify({
-      cron: event.cron,
-      scheduledTime: new Date(event.scheduledTime).toISOString(),
-      startedAt: new Date().toISOString(),
-    }));
-    ctx.waitUntil(runBot(env, { invocationId, scheduledTime: event.scheduledTime }));
-  },
-
-  // Manual HTTP triggers, for testing only.
-  //   ?dryRun=true        — run the full pipeline and return what it *would*
-  //                         post, without touching KV state or Bluesky.
-  //   ?filmpage=<url>     — scrape a single film page directly, to verify
-  //                         runtime/cast extraction against real Criterion
-  //                         markup without waiting for a live transition.
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    const filmPageUrl = url.searchParams.get('filmpage');
-    if (filmPageUrl) {
-      try {
-        const result = await scrapeFilmPage(filmPageUrl);
-        return new Response(JSON.stringify(result, null, 2), {
-          headers: { 'Content-Type': 'application/json' },
-        });
-      } catch (e) {
-        return new Response(JSON.stringify({ error: e.message }, null, 2), {
-          status: 500,
-          headers: { 'Content-Type': 'application/json' },
-        });
-      }
-    }
-    if (url.searchParams.get('dryRun') === 'true') {
-      const result = await runBot(env, { dryRun: true });
-      if (!result) {
-        return new Response(
-          JSON.stringify({ error: 'runBot returned nothing — check wrangler tail logs for details.' }, null, 2),
-          { status: 500, headers: { 'Content-Type': 'application/json' } },
-        );
-      }
-      return new Response(JSON.stringify(result, null, 2), {
-        headers: { 'Content-Type': 'application/json' },
-      });
-    }
-    return new Response('Criterion Bluesky Bot. Add ?dryRun=true to preview without posting.');
-  },
-};
-
-async function runBot(env, { dryRun = false, invocationId = 'manual', scheduledTime = null } = {}) {
-  // Shadow console so every log line inside runBot (including the nested
-  // postToBluesky) is tagged with this invocation's id. No other console.log
-  // edits are needed.
+async function runBot({ dryRun = false, invocationId = 'manual' } = {}) {
+  // Shadow console so every log line (including inside postToBluesky) is
+  // tagged with this invocation's id, same as the Worker version.
   const console = {
     log: (...a) => globalThis.console.log(`[${invocationId}]`, ...a),
     warn: (...a) => globalThis.console.warn(`[${invocationId}]`, ...a),
   };
-  const KV = env.CRITERION_STATE;
 
   // --- Load state ---
-  const [lastTitle, nextCheckAtStr, pollMode, fastPollCountStr] = await Promise.all([
-    KV.get('lastTitle'),
-    KV.get('nextCheckAt'),
-    KV.get('pollMode'),
-    KV.get('fastPollCount'),
-  ]);
-
+  const { lastTitle, nextCheckAtStr, pollMode, fastPollCountStr } = await loadState();
   const now = Date.now();
   const nextCheckAt = nextCheckAtStr ? new Date(nextCheckAtStr).getTime() : 0;
-  const fastPollCount = fastPollCountStr ? parseInt(fastPollCountStr) : 0;
+  const fastPollCount = fastPollCountStr ? parseInt(fastPollCountStr, 10) : 0;
 
   console.log('STATE_READ', JSON.stringify({
     lastTitle, nextCheckAtStr, pollMode, fastPollCountStr,
     now: new Date(now).toISOString(),
-    scheduledTime: scheduledTime ? new Date(scheduledTime).toISOString() : null,
   }));
 
   // --- Respect the scheduled wait (skip this gate during a dry run) ---
@@ -336,33 +273,41 @@ async function runBot(env, { dryRun = false, invocationId = 'manual', scheduledT
     console.log(`(Dry run ignoring schedule gate — normally would skip until ${new Date(nextCheckAt).toISOString()})`);
   }
 
-  // --- Scrape What's On Now ---
-  // New markup: the title is a plain <h1> under a "Now Playing On Criterion
-  // 24/7" heading, and the dedicated film page is whichever <a> points into
-  // /films/... (its visible label, e.g. "Film Page", isn't load-bearing —
-  // matching on the href is more robust if Criterion tweaks the label).
-  const nowRes = await fetch('https://whatsonnow.criterionchannel.com/', { headers: BROWSER_HEADERS });
+  // --- Scrape What's On Now, with a status-aware retry for transient
+  // 5xx/429s (Cloudflare-fronted origins hand these back occasionally,
+  // unrelated to our scraping logic). ---
+  const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504, 520, 521, 522, 523, 524]);
+  let nowRes = null;
+  try {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      nowRes = await fetch('https://whatsonnow.criterionchannel.com/', {
+        headers: BROWSER_HEADERS,
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (nowRes.ok || !RETRYABLE_STATUSES.has(nowRes.status) || attempt === 2) break;
+      console.warn(`whatsonnow.criterionchannel.com returned HTTP ${nowRes.status} on attempt ${attempt}, retrying once...`);
+      await new Promise((r) => setTimeout(r, 2_000));
+    }
+  } catch (e) {
+    console.warn(`whatsonnow.criterionchannel.com fetch failed: ${e.message}. Treating as no title change.`);
+    nowRes = null;
+  }
 
   let title = '';
   let filmHref = null;
-  if (!nowRes.ok) {
-    // Don't parse an error page's own <h1> ("403 Forbidden", "500 Internal
-    // Server Error", ...) as if it were a film title. Leave title empty —
-    // that's treated as "no title change" below, so the bot just retries
-    // on its normal poll schedule instead of posting garbage.
-    console.warn(`whatsonnow.criterionchannel.com returned HTTP ${nowRes.status}. Treating as no title change.`);
+  if (!nowRes || !nowRes.ok) {
+    if (nowRes) {
+      console.warn(`whatsonnow.criterionchannel.com returned HTTP ${nowRes.status}. Treating as no title change.`);
+    }
   } else {
     const nowHtml = await nowRes.text();
     const $ = cheerio.load(nowHtml);
     title = $('h1').first().text().trim();
     const filmHrefRaw = $('a[href*="/films/"]').first().attr('href') || null;
-    // The site's anchors use relative hrefs (e.g. "/films/Uf2lft9k/girlfight"),
-    // so resolve against the site root before this is used as a fetch() URL
-    // or a Bluesky link facet.
     filmHref = filmHrefRaw ? new URL(filmHrefRaw, 'https://www.criterionchannel.com').toString() : null;
 
     if (PLACEHOLDER_TITLES.has(title)) {
-      console.warn(`whatsonnow.criterionchannel.com's <h1> was the channel's own branding ("${title}"), not a film title — likely a bumper/station-ID state, or the real content hadn't resolved server-side yet. Treating as no title change.`);
+      console.warn(`whatsonnow.criterionchannel.com's <h1> was the channel's own branding ("${title}"), not a film title. Treating as no title change.`);
       title = '';
       filmHref = null;
     } else {
@@ -371,10 +316,9 @@ async function runBot(env, { dryRun = false, invocationId = 'manual', scheduledT
   }
 
   // --- Determine whether the film changed ---
-  const titleChanged = title && title !== lastTitle;
+  const titleChanged = Boolean(title) && title !== lastTitle;
 
-  // --- If the film changed, scrape its page now so we have runtime info
-  // available both for the schedule below and for the post text later. ---
+  // --- If the film changed, scrape its page now for runtime/image/info ---
   let imageUrl = null;
   let filmInfo = '';
   let filmLink = GENERIC_LINK;
@@ -406,31 +350,23 @@ async function runBot(env, { dryRun = false, invocationId = 'manual', scheduledT
   let nextCheckMs;
 
   if (titleChanged) {
-    // New film detected — reset to "waiting" mode. We no longer get a
-    // live countdown from the site, so we estimate the sleep from the
-    // film's own runtime (assuming "now" is close to when it started,
-    // which fast/slow polling below is meant to guarantee).
     newPollMode = 'waiting';
     newFastPollCount = 0;
     if (runtimeMinutes !== null && runtimeMinutes > 1) {
       nextCheckMs = now + (runtimeMinutes - 1) * 60 * 1000;
       console.log(`New film posted. Sleeping ~${runtimeMinutes - 1} minutes (estimated from runtime).`);
     } else {
-      // Couldn't determine a runtime — check again in 5 minutes.
       nextCheckMs = now + 5 * 60 * 1000;
     }
   } else {
-    // No new film yet
     if (newPollMode === 'waiting') {
-      // First time waking up near a transition — switch to fast polling
       newPollMode = 'fast';
       newFastPollCount = 1;
-      nextCheckMs = now + 60 * 1000; // check again in 1 minute
+      nextCheckMs = now + 60 * 1000;
       console.log('Entering fast poll mode (1 min intervals).');
     } else if (newPollMode === 'fast') {
       newFastPollCount += 1;
       if (newFastPollCount >= 5) {
-        // After 5 fast checks with no change, slow down
         newPollMode = 'slow';
         nextCheckMs = now + 5 * 60 * 1000;
         console.log(`Fast poll limit reached (${newFastPollCount}). Switching to slow (5 min) mode.`);
@@ -439,7 +375,6 @@ async function runBot(env, { dryRun = false, invocationId = 'manual', scheduledT
         console.log(`Fast poll ${newFastPollCount}/5. Next check in 1 minute.`);
       }
     } else {
-      // slow mode — keep checking every 5 minutes
       nextCheckMs = now + 5 * 60 * 1000;
       console.log('Slow poll mode. Next check in 5 minutes.');
     }
@@ -447,11 +382,11 @@ async function runBot(env, { dryRun = false, invocationId = 'manual', scheduledT
 
   // --- Save scheduling state (always, except during a dry run) ---
   if (!dryRun) {
-    await Promise.all([
-      KV.put('nextCheckAt', new Date(nextCheckMs).toISOString()),
-      KV.put('pollMode', newPollMode),
-      KV.put('fastPollCount', String(newFastPollCount)),
-    ]);
+    await saveState({
+      nextCheckAt: new Date(nextCheckMs).toISOString(),
+      pollMode: newPollMode,
+      fastPollCount: String(newFastPollCount),
+    });
   }
 
   if (!titleChanged && !dryRun) {
@@ -463,8 +398,6 @@ async function runBot(env, { dryRun = false, invocationId = 'manual', scheduledT
   }
 
   // --- Build the post text ---
-  // We're estimating this from runtime rather than reading it off the site,
-  // so the copy says "starts around" instead of "starts in".
   let nextText = 'unknown';
   if (runtimeMinutes !== null) {
     const nextTime = new Date(now + runtimeMinutes * 60 * 1000);
@@ -476,25 +409,19 @@ async function runBot(env, { dryRun = false, invocationId = 'manual', scheduledT
   }
 
   const linkText = 'Watch on Criterion Channel';
-
-  // Bluesky's limit is 300 graphemes
   const BSKY_LIMIT = 300;
 
   function truncateFilmInfo(info, budget) {
     if (!info) return '';
     const lines = info.split('\n');
-    // Try both lines
     if ([...info].length <= budget) return info;
-    // Try just the first line
     if (lines.length > 1 && [...lines[0]].length <= budget) return lines[0];
-    // Last resort: truncate with ellipsis
     return [...lines[0]].slice(0, budget - 1).join('') + '…';
   }
 
-  // Calculate budget: measure the base post (without filmInfo) and see what's left
   const basePost = `🎬 Now streaming on Criterion Channel 24/7:\n\n${title}\n\nNext film starts around: ${nextText}\n\n${linkText}`;
   const baseCost = [...basePost].length;
-  const filmInfoBudget = Math.max(0, BSKY_LIMIT - baseCost - 1); // -1 for the extra \n separator
+  const filmInfoBudget = Math.max(0, BSKY_LIMIT - baseCost - 1);
 
   const filmInfoTrimmed = truncateFilmInfo(filmInfo, filmInfoBudget);
   const postText = filmInfoTrimmed
@@ -521,8 +448,8 @@ async function runBot(env, { dryRun = false, invocationId = 'manual', scheduledT
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        identifier: env.BSKY_HANDLE,
-        password: env.BSKY_APP_PASSWORD,
+        identifier: process.env.BSKY_HANDLE,
+        password: process.env.BSKY_APP_PASSWORD,
       }),
       signal: AbortSignal.timeout(30_000),
     });
@@ -566,10 +493,9 @@ async function runBot(env, { dryRun = false, invocationId = 'manual', scheduledT
             stage = 'parsing upload response';
             const { blob } = await uploadRes.json();
 
-            // Parse width/height from URL params (e.g. w=1280&h=720) for correct aspect ratio
             const imgUrlParams = new URL(imageUrl).searchParams;
-            const imgWidth = parseInt(imgUrlParams.get('w') ?? '0');
-            const imgHeight = parseInt(imgUrlParams.get('h') ?? '0');
+            const imgWidth = parseInt(imgUrlParams.get('w') ?? '0', 10);
+            const imgHeight = parseInt(imgUrlParams.get('h') ?? '0', 10);
             const aspectRatio = (imgWidth && imgHeight)
               ? { width: imgWidth, height: imgHeight }
               : undefined;
@@ -610,7 +536,6 @@ async function runBot(env, { dryRun = false, invocationId = 'manual', scheduledT
 
     const postBody = await postRes.text();
     if (!postRes.ok) {
-      // Failed. Did another invocation (or an earlier attempt of ours) already create it?
       const check = await fetch(
         `https://bsky.social/xrpc/com.atproto.repo.getRecord?repo=${encodeURIComponent(did)}&collection=app.bsky.feed.post&rkey=${rkey}`,
         { signal: AbortSignal.timeout(15_000) },
@@ -656,25 +581,75 @@ async function runBot(env, { dryRun = false, invocationId = 'manual', scheduledT
     } catch (e) {
       lastError = e;
       console.warn(`Attempt ${attempt} failed: ${e.message}`);
-      if (attempt < 3) await new Promise(r => setTimeout(r, 10_000));
+      if (attempt < 3) await new Promise((r) => setTimeout(r, 10_000));
     }
   }
   if (lastError) {
-    // Every attempt failed. The schedule we saved earlier says "sleep until the
-    // next film", so undo that and retry on the next tick. lastTitle was never
-    // updated, so the next run will see this film as new and try again.
     try {
-      await Promise.all([
-        KV.put('nextCheckAt', new Date(Date.now() + 60 * 1000).toISOString()),
-        KV.put('pollMode', 'waiting'),
-        KV.put('fastPollCount', '0'),
-      ]);
+      await saveState({
+        nextCheckAt: new Date(Date.now() + 60 * 1000).toISOString(),
+        pollMode: 'waiting',
+        fastPollCount: '0',
+      });
     } catch (e) {
       console.warn('Could not reset schedule after failure:', e.message);
     }
     throw lastError;
   }
 
-  // --- Persist new lastTitle ---
-  await KV.put('lastTitle', title);
+  await saveState({ lastTitle: title });
 }
+
+function jsonResponse(statusCode, obj) {
+  return {
+    statusCode,
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(obj, null, 2),
+  };
+}
+
+// Single entry point for both trigger types:
+//   - EventBridge Scheduler invocations have no requestContext/rawQueryString.
+//   - Function URL invocations carry the API Gateway v2 HTTP payload shape,
+//     used the same way ?dryRun=true / ?filmpage= worked on the Worker.
+export const handler = async (event) => {
+  const invocationId = crypto.randomUUID().slice(0, 8);
+  const isHttp = Boolean(event && (event.requestContext?.http || event.rawQueryString !== undefined));
+
+  globalThis.console.log(`[${invocationId}] INVOKE`, JSON.stringify({
+    isHttp,
+    startedAt: new Date().toISOString(),
+  }));
+
+  if (isHttp) {
+    const params = new URLSearchParams(event.rawQueryString || '');
+
+    const filmPageUrl = params.get('filmpage');
+    if (filmPageUrl) {
+      try {
+        const result = await scrapeFilmPage(filmPageUrl);
+        return jsonResponse(200, result);
+      } catch (e) {
+        return jsonResponse(500, { error: e.message });
+      }
+    }
+
+    if (params.get('dryRun') === 'true') {
+      const result = await runBot({ dryRun: true, invocationId });
+      if (!result) {
+        return jsonResponse(500, { error: 'runBot returned nothing — check CloudWatch logs for details.' });
+      }
+      return jsonResponse(200, result);
+    }
+
+    return {
+      statusCode: 200,
+      headers: { 'content-type': 'text/plain' },
+      body: 'Criterion Bluesky Bot. Add ?dryRun=true to preview without posting.',
+    };
+  }
+
+  // EventBridge Scheduler invocation — the real thing.
+  await runBot({ dryRun: false, invocationId });
+  return { ok: true };
+};

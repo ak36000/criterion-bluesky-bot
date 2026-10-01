@@ -1,13 +1,12 @@
 {
+  "name": "criterion-bluesky-bot-lambda",
+  "version": "1.0.0",
+  "private": true,
   "type": "module",
-  "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
-  },
+  "description": "AWS Lambda port of the Criterion Channel Bluesky bot",
   "dependencies": {
-    "cheerio": "^1.0.0"
-  },
-  "devDependencies": {
-    "wrangler": "^4.95.0"
+    "cheerio": "^1.0.0",
+    "@aws-sdk/client-dynamodb": "^3.658.0",
+    "@aws-sdk/lib-dynamodb": "^3.658.0"
   }
 }
