@@ -43,6 +43,23 @@ const GENERIC_LINK = 'https://www.criterionchannel.com/live/1emmgvqX/criterion-2
 // clobber lastTitle.
 const PLACEHOLDER_TITLES = new Set(['Criterion 24/7', 'Criterion Channel']);
 
+// --- Polling schedule tuning ---
+const FAST_INTERVAL_MS = 60 * 1000;
+const SLOW_INTERVAL_MS = 5 * 60 * 1000;
+
+// `now` is sampled after the EventBridge tick lands (plus cold start), so
+// now + 60s is usually slightly AFTER the next tick, which then gets skipped
+// by the nextCheckAt gate and silently halves the poll rate. Scheduling a
+// little early avoids that; the worst case is one extra cheap no-op read.
+const SCHEDULE_SLACK_MS = 20 * 1000;
+const scheduleIn = (now, ms) => now + ms - SCHEDULE_SLACK_MS;
+
+// Margin = minutes before the *estimated* end of a film that we start polling.
+const MARGIN_TIGHT = 3;    // used once an early wake has caught a change in fast mode
+const MARGIN_START = 10;   // default, and the floor after a first-try detection
+const MARGIN_MAX = 20;     // cap on escalation
+const FAST_GRACE_POLLS = 5; // fast polls to keep going after the margin window
+
 function isGenericLink(href) {
   if (!href) return true;
   return href.replace(/\/$/, '') === GENERIC_LINK;
@@ -73,11 +90,23 @@ function dedupeRkey(title, nowMs) {
   return makeTid(bucketMicros, hash10(title));
 }
 
-// Parse a runtime out of text like "1 hr 50 min" or "50 min". Criterion's
+// Parse a release year and runtime out of text like "1 hr 50 min" or "50 min". Criterion's
 // film pages render the release year glued directly to the front of this
 // string with no separator (e.g. a 2000 release that runs 1hr50 shows up in
 // scraped text as "20001 hr 50 min"), so we strip a plausible leading year
 // before parsing the numbers.
+
+function validYear(y) {
+  const n = parseInt(y, 10);
+  return n >= 1888 && n <= new Date().getFullYear() + 1 ? String(n) : null;
+}
+
+function parseReleaseYear(rawText) {
+  if (!rawText) return null;
+  const m = rawText.match(/((?:18|19|20)\d{2})\s*\d+\s*(?:hr|min)\b/i);
+  return m ? validYear(m[1]) : null;
+}
+
 function parseRuntimeMinutes(rawText) {
   if (!rawText) return null;
   const stripYear = (digits) => (digits.length >= 5 ? digits.replace(/^(19|20)\d{2}/, '') : digits);
@@ -154,22 +183,28 @@ function extractFromJsonLd($doc) {
   const director = names(videoNode?.director).join(', ');
   const cast = names(movieNode?.actor ?? videoNode?.actor).join(', ');
   const runtimeMinutes = parseISO8601DurationMinutes(movieNode?.duration ?? videoNode?.duration);
+    // Only Movie-node fields: VideoObject dates are likely the upload date.
+  const rawDate = movieNode?.datePublished ?? movieNode?.dateCreated ?? movieNode?.copyrightYear;
+  const yearMatch = String(rawDate ?? '').match(/\d{4}/);
+  const releaseYear = yearMatch ? validYear(yearMatch[0]) : null;
 
-  return { director, cast, runtimeMinutes };
+  return { director, cast, runtimeMinutes, releaseYear };
 }
 
 // Positional fallback for when JSON-LD isn't present or is missing a field.
 function extractPositionally($doc) {
   let runtimeMinutes = null;
+  let releaseYear = null; 
   let director = '';
   let $scope = $doc('h1').first();
   for (let i = 0; i < 3 && $scope.length; i++) {
     if (runtimeMinutes === null) runtimeMinutes = parseRuntimeMinutes($scope.text());
+	if (releaseYear === null) releaseYear = parseReleaseYear($scope.text()); 
     if (!director) {
       const prevText = $scope.prev().text().trim();
       if (looksLikeName(prevText)) director = prevText;
     }
-    if (runtimeMinutes !== null && director) break;
+    if (runtimeMinutes !== null && director && releaseYear) break;
     $scope = $scope.parent();
   }
 
@@ -182,7 +217,7 @@ function extractPositionally($doc) {
     starringMatch ? `Starring ${starringMatch[1].trim()}` : '',
   ].filter(Boolean).join('\n');
 
-  return { runtimeMinutes, filmInfo };
+  return { runtimeMinutes, filmInfo, releaseYear };
 }
 
 // Scrape a dedicated film page (https://www.criterionchannel.com/films/...)
@@ -195,17 +230,19 @@ async function scrapeFilmPage(url) {
 
   const imageUrl = $film('meta[property="og:image"]').attr('content') ?? null;
 
-  const { director, cast, runtimeMinutes: jsonLdRuntime } = extractFromJsonLd($film);
+  const { director, cast, runtimeMinutes: jsonLdRuntime, releaseYear: jsonLdYear } = extractFromJsonLd($film);
   let runtimeMinutes = jsonLdRuntime;
+  let releaseYear = jsonLdYear;
   let filmInfo = [director ? `Directed by ${director}` : '', cast ? `Starring ${cast}` : ''].filter(Boolean).join('\n');
 
-  if (runtimeMinutes === null || !filmInfo) {
+  if (runtimeMinutes === null || !filmInfo || !releaseYear) {
     const fallback = extractPositionally($film);
     if (runtimeMinutes === null) runtimeMinutes = fallback.runtimeMinutes;
     if (!filmInfo) filmInfo = fallback.filmInfo;
+    if (!releaseYear) releaseYear = fallback.releaseYear;
   }
 
-  return { imageUrl, runtimeMinutes, filmInfo };
+  return { imageUrl, runtimeMinutes, filmInfo, releaseYear };
 }
 
 // --- DynamoDB state (replaces the Worker's KV namespace) ---
@@ -220,6 +257,7 @@ async function loadState() {
     nextCheckAtStr: item.nextCheckAt ?? null,
     pollMode: item.pollMode ?? null,
     fastPollCountStr: item.fastPollCount ?? null,
+	margin: item.margin ?? null,
   };
 }
 
@@ -254,13 +292,13 @@ async function runBot({ dryRun = false, invocationId = 'manual' } = {}) {
   };
 
   // --- Load state ---
-  const { lastTitle, nextCheckAtStr, pollMode, fastPollCountStr } = await loadState();
+  const { lastTitle, nextCheckAtStr, pollMode, fastPollCountStr, margin: marginState } = await loadState();
   const now = Date.now();
   const nextCheckAt = nextCheckAtStr ? new Date(nextCheckAtStr).getTime() : 0;
   const fastPollCount = fastPollCountStr ? parseInt(fastPollCountStr, 10) : 0;
 
   console.log('STATE_READ', JSON.stringify({
-    lastTitle, nextCheckAtStr, pollMode, fastPollCountStr,
+    lastTitle, nextCheckAtStr, pollMode, fastPollCountStr, marginState, 
     now: new Date(now).toISOString(),
   }));
 
@@ -323,6 +361,7 @@ async function runBot({ dryRun = false, invocationId = 'manual' } = {}) {
   let filmInfo = '';
   let filmLink = GENERIC_LINK;
   let runtimeMinutes = null;
+  let releaseYear = null;
 
   if (titleChanged) {
     if (filmHref && !isGenericLink(filmHref)) {
@@ -332,9 +371,11 @@ async function runBot({ dryRun = false, invocationId = 'manual' } = {}) {
         imageUrl = scraped.imageUrl;
         filmInfo = scraped.filmInfo;
         runtimeMinutes = scraped.runtimeMinutes;
+        releaseYear = scraped.releaseYear; 
         console.log(`Film page: ${filmHref}`);
         console.log(`Image URL: ${imageUrl}`);
         console.log(`Runtime: ${runtimeMinutes ?? 'unknown'} min`);
+        console.log(`Release year: ${releaseYear ?? 'unknown'}`);
         console.log(`Film info: ${filmInfo}`);
       } catch (e) {
         console.warn('Could not fetch/parse film page:', e.message);
@@ -344,40 +385,59 @@ async function runBot({ dryRun = false, invocationId = 'manual' } = {}) {
     }
   }
 
-  // --- Determine next check time and poll mode ---
+  // --- Determine next check time, poll mode, and wake-up margin ---
+  const currentMargin = marginState ?? MARGIN_START;
   let newPollMode = pollMode ?? 'waiting';
   let newFastPollCount = fastPollCount;
+  let newMargin = currentMargin;
   let nextCheckMs;
 
   if (titleChanged) {
+    // How we detected the change tells us how far off our end-of-film
+    // estimate was, which decides how early to wake next time.
+    if (pollMode === 'fast') {
+      // We woke early and caught the change within one 1-minute poll.
+      newMargin = MARGIN_TIGHT;
+      console.log(`DETECTION fast: caught after ${fastPollCount} unchanged poll(s); end estimate was off by ~${(currentMargin - fastPollCount + 0.5).toFixed(1)} min (positive = estimated too late). Margin ${currentMargin} -> ${newMargin}.`);
+    } else if (pollMode === 'slow') {
+      // Slow polling can be up to 5 min late, so don't trust it as a precise signal.
+      newMargin = MARGIN_START;
+      console.log(`DETECTION slow: caught during slow polling. Margin ${currentMargin} -> ${newMargin}.`);
+    } else {
+      // First poll after waking: the film had already changed, so lag is unknown (>= currentMargin).
+      newMargin = Math.min(Math.max(currentMargin + 5, MARGIN_START), MARGIN_MAX);
+      console.log(`DETECTION first-try: end estimate was off by >= ${currentMargin} min. Margin ${currentMargin} -> ${newMargin}.`);
+    }
+
     newPollMode = 'waiting';
     newFastPollCount = 0;
     if (runtimeMinutes !== null && runtimeMinutes > 1) {
-      nextCheckMs = now + (runtimeMinutes - 1) * 60 * 1000;
-      console.log(`New film posted. Sleeping ~${runtimeMinutes - 1} minutes (estimated from runtime).`);
+      const sleepMin = Math.max(runtimeMinutes - newMargin, 1);
+      nextCheckMs = scheduleIn(now, sleepMin * 60 * 1000);
+      console.log(`New film posted. Sleeping ~${sleepMin} min (runtime ${runtimeMinutes} - margin ${newMargin}).`);
     } else {
-      nextCheckMs = now + 5 * 60 * 1000;
+      nextCheckMs = scheduleIn(now, SLOW_INTERVAL_MS);
+    }
+  } else if (newPollMode === 'waiting') {
+    newPollMode = 'fast';
+    newFastPollCount = 1;
+    nextCheckMs = scheduleIn(now, FAST_INTERVAL_MS);
+    console.log('Entering fast poll mode (1 min intervals).');
+  } else if (newPollMode === 'fast') {
+    newFastPollCount += 1;
+    // The fast window must outlast the early-wake margin, plus some grace.
+    const fastLimit = currentMargin + FAST_GRACE_POLLS;
+    if (newFastPollCount >= fastLimit) {
+      newPollMode = 'slow';
+      nextCheckMs = scheduleIn(now, SLOW_INTERVAL_MS);
+      console.log(`Fast poll limit reached (${newFastPollCount}/${fastLimit}). Switching to slow (5 min) mode.`);
+    } else {
+      nextCheckMs = scheduleIn(now, FAST_INTERVAL_MS);
+      console.log(`Fast poll ${newFastPollCount}/${fastLimit}. Next check in 1 minute.`);
     }
   } else {
-    if (newPollMode === 'waiting') {
-      newPollMode = 'fast';
-      newFastPollCount = 1;
-      nextCheckMs = now + 60 * 1000;
-      console.log('Entering fast poll mode (1 min intervals).');
-    } else if (newPollMode === 'fast') {
-      newFastPollCount += 1;
-      if (newFastPollCount >= 5) {
-        newPollMode = 'slow';
-        nextCheckMs = now + 5 * 60 * 1000;
-        console.log(`Fast poll limit reached (${newFastPollCount}). Switching to slow (5 min) mode.`);
-      } else {
-        nextCheckMs = now + 60 * 1000;
-        console.log(`Fast poll ${newFastPollCount}/5. Next check in 1 minute.`);
-      }
-    } else {
-      nextCheckMs = now + 5 * 60 * 1000;
-      console.log('Slow poll mode. Next check in 5 minutes.');
-    }
+    nextCheckMs = scheduleIn(now, SLOW_INTERVAL_MS);
+    console.log('Slow poll mode. Next check in 5 minutes.');
   }
 
   // --- Save scheduling state (always, except during a dry run) ---
@@ -386,6 +446,7 @@ async function runBot({ dryRun = false, invocationId = 'manual' } = {}) {
       nextCheckAt: new Date(nextCheckMs).toISOString(),
       pollMode: newPollMode,
       fastPollCount: String(newFastPollCount),
+	  margin: newMargin,
     });
   }
 
@@ -419,13 +480,15 @@ async function runBot({ dryRun = false, invocationId = 'manual' } = {}) {
     return [...lines[0]].slice(0, budget - 1).join('') + '…';
   }
 
-  const basePost = `🎬 Now streaming on Criterion Channel 24/7:\n\n${title}\n\nNext film starts around: ${nextText}\n\n${linkText}`;
+  const titleLine = releaseYear ? `${title} (${releaseYear})` : title;
+
+  const basePost = `🎬 Now streaming on Criterion Channel 24/7:\n\n${titleLine}\n\nNext film starts around: ${nextText}\n\n${linkText}`;
   const baseCost = [...basePost].length;
   const filmInfoBudget = Math.max(0, BSKY_LIMIT - baseCost - 1);
 
   const filmInfoTrimmed = truncateFilmInfo(filmInfo, filmInfoBudget);
   const postText = filmInfoTrimmed
-    ? `🎬 Now streaming on Criterion Channel 24/7:\n\n${title}\n${filmInfoTrimmed}\n\nNext film starts around: ${nextText}\n\n${linkText}`
+    ? `🎬 Now streaming on Criterion Channel 24/7:\n\n${titleLine}\n${filmInfoTrimmed}\n\nNext film starts around: ${nextText}\n\n${linkText}`
     : basePost;
 
   const encoder = new TextEncoder();
@@ -561,9 +624,15 @@ async function runBot({ dryRun = false, invocationId = 'manual' } = {}) {
       filmLink,
       imageUrl,
       runtimeMinutes,
+	  releaseYear,
       filmInfo,
       postText,
       facets,
+	  schedule: {
+        pollMode, newPollMode,
+        margin: currentMargin, newMargin,
+        nextCheckAt: new Date(nextCheckMs).toISOString(),
+      },
       rkey,
     };
   }

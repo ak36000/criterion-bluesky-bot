@@ -17,15 +17,14 @@ Runs on **AWS Lambda**, checking [whatsonnow.criterionchannel.com](https://whats
 
 ### Polling behavior
 
-- After a title change, the bot estimates the next film's start time from the current film's own runtime (scraped from the film page — the site doesn't expose a live countdown) and sleeps until shortly before that.
-- If no change is detected near an expected transition, it escalates: 5 checks at 1-minute intervals ("fast" mode), then settles into 5-minute intervals ("slow" mode) until a real change is seen.
+- After a title change, the bot sleeps until a margin (3-20 minutes, adaptive) before the estimated end, based on the film's runtime (scraped from the film page - the site no longer exposes a next start time).
+- The margin widens when a change is found on the first poll after waking, and shrinks once an early wake catches it in fast mode.
 - Transient errors from Criterion's side (403, 429, 5xx) are retried once in-request and otherwise treated as "no change, try again on the normal schedule" rather than crashing or posting garbage.
 
 ### Title/metadata scraping notes
 
 - The "now playing" title comes from the page's `<h1>`. A couple of known non-film placeholder values (e.g. `"Criterion 24/7"`, seen during what looks like a bumper/station-ID state) are explicitly filtered out so they're never mistaken for a real title.
-- Director/cast/runtime are read primarily from the film page's embedded `schema.org` JSON-LD (`VideoObject`/`Movie`), which gives exact values with no guessing. A positional fallback (walking up from the `<h1>`, text-pattern matching) only kicks in if that JSON-LD is ever missing.
-- The poster image's aspect ratio is read directly from the downloaded WebP file's binary header (`getWebpDimensions`), not from CDN URL query params — Criterion's image URLs don't actually carry width/height params, so relying on them silently produced no aspect ratio hint at all and Bluesky would letterbox the image.
+- Director/cast/runtime/release year are read primarily from the film page's embedded `schema.org` JSON-LD (`VideoObject`/`Movie`), which gives exact values with no guessing. A positional fallback (walking up from the `<h1>`, text-pattern matching) only kicks in if that JSON-LD is ever missing.
 - A deterministic record key (`rkey`, derived from the title + a 30-minute time bucket) makes duplicate posts from concurrent/retried invocations impossible — the Bluesky PDS rejects a second write to the same key.
 
 ## Repo layout
@@ -82,4 +81,4 @@ Every log line is tagged with an invocation ID (e.g. `[1f3f6690]`) so concurrent
 
 ## Cost
 
-Everything here — Lambda invocations, DynamoDB reads/writes, EventBridge Scheduler — runs comfortably within AWS's Always Free monthly limits at this bot's volume (roughly one real check every few minutes, most other ticks a cheap no-op read). A zero-spend budget alert is recommended so you'd be notified automatically if that ever changed, rather than needing to check manually.
+Everything here — Lambda invocations, DynamoDB reads/writes, EventBridge Scheduler — runs comfortably within AWS's Always Free monthly limits at this bot's volume (roughly one real check every few minutes, most other ticks a cheap no-op read). A zero-spend budget alert has been setup so a notification will be provided automatically if that ever changed.
