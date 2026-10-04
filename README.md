@@ -25,6 +25,7 @@ Runs on **AWS Lambda**, checking [whatsonnow.criterionchannel.com](https://whats
 
 - The "now playing" title comes from the page's `<h1>`. A couple of known non-film placeholder values (e.g. `"Criterion 24/7"`, seen during what looks like a bumper/station-ID state) are explicitly filtered out so they're never mistaken for a real title.
 - Director/cast/runtime/release year are read primarily from the film page's embedded `schema.org` JSON-LD (`VideoObject`/`Movie`), which gives exact values with no guessing. A positional fallback (walking up from the `<h1>`, text-pattern matching) only kicks in if that JSON-LD is ever missing.
+- The poster image's aspect ratio is read directly from the downloaded WebP file's binary header (`getWebpDimensions`), not from CDN URL query params — Criterion's image URLs don't actually carry width/height params, so relying on them silently produced no aspect ratio hint at all and Bluesky would letterbox the image.
 - A deterministic record key (`rkey`, derived from the title + a 30-minute time bucket) makes duplicate posts from concurrent/retried invocations impossible — the Bluesky PDS rejects a second write to the same key.
 
 ## Repo layout

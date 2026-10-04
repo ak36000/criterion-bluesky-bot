@@ -90,6 +90,37 @@ function dedupeRkey(title, nowMs) {
   return makeTid(bucketMicros, hash10(title));
 }
 
+// Read pixel dimensions from a WebP file's header. Criterion's image URLs
+// don't carry w/h query params, so the downloaded bytes are the only
+// reliable source. Returns null for anything that isn't a recognizable WebP.
+function getWebpDimensions(buf) {
+  const b = new Uint8Array(buf);
+  if (b.length < 30) return null;
+  const tag = (o) => String.fromCharCode(b[o], b[o + 1], b[o + 2], b[o + 3]);
+  if (tag(0) !== 'RIFF' || tag(8) !== 'WEBP') return null;
+
+  const chunk = tag(12);
+  if (chunk === 'VP8X') {
+    return {
+      width: 1 + (b[24] | (b[25] << 8) | (b[26] << 16)),
+      height: 1 + (b[27] | (b[28] << 8) | (b[29] << 16)),
+    };
+  }
+  if (chunk === 'VP8 ') {
+    if (b[23] !== 0x9d || b[24] !== 0x01 || b[25] !== 0x2a) return null;
+    return {
+      width: (b[26] | (b[27] << 8)) & 0x3fff,
+      height: (b[28] | (b[29] << 8)) & 0x3fff,
+    };
+  }
+  if (chunk === 'VP8L') {
+    if (b[20] !== 0x2f) return null;
+    const bits = (b[21] | (b[22] << 8) | (b[23] << 16) | (b[24] << 24)) >>> 0;
+    return { width: (bits & 0x3fff) + 1, height: ((bits >>> 14) & 0x3fff) + 1 };
+  }
+  return null;
+}
+
 // Parse a release year and runtime out of text like "1 hr 50 min" or "50 min". Criterion's
 // film pages render the release year glued directly to the front of this
 // string with no separator (e.g. a 2000 release that runs 1hr50 shows up in
@@ -556,12 +587,11 @@ async function runBot({ dryRun = false, invocationId = 'manual' } = {}) {
             stage = 'parsing upload response';
             const { blob } = await uploadRes.json();
 
-            const imgUrlParams = new URL(imageUrl).searchParams;
-            const imgWidth = parseInt(imgUrlParams.get('w') ?? '0', 10);
-            const imgHeight = parseInt(imgUrlParams.get('h') ?? '0', 10);
-            const aspectRatio = (imgWidth && imgHeight)
-              ? { width: imgWidth, height: imgHeight }
-              : undefined;
+            const dims = getWebpDimensions(imgBuffer);
+            const aspectRatio = dims ? { width: dims.width, height: dims.height } : undefined;
+            console.log(dims
+              ? `Image dimensions: ${dims.width}x${dims.height}`
+              : 'Could not read image dimensions; posting without aspectRatio.');
 
             embed = {
               $type: 'app.bsky.embed.images',
