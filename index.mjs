@@ -276,6 +276,38 @@ async function scrapeFilmPage(url) {
   return { imageUrl, runtimeMinutes, filmInfo, releaseYear };
 }
 
+// Repairs text whose UTF-8 bytes were mis-decoded as a single-byte charset
+// (e.g. "Fassbinder‚Äôs Women" -> "Fassbinder’s Women"). Returns the input
+// untouched if it doesn't look like mojibake.
+const REVERSE_MAPS = ['macintosh', 'windows-1252'].map((enc) => {
+  const dec = new TextDecoder(enc);
+  const map = new Map();
+  for (let b = 0x80; b <= 0xff; b++) {
+    map.set(dec.decode(new Uint8Array([b])), b);
+  }
+  return map;
+});
+
+function fixMojibake(str) {
+  if (!str || !/[^\x00-\x7f]/.test(str)) return str; // pure ASCII: nothing to fix
+  for (const map of REVERSE_MAPS) {
+    const bytes = [];
+    let ok = true;
+    for (const ch of str) {
+      const cp = ch.codePointAt(0);
+      if (cp < 0x80) bytes.push(cp);
+      else if (map.has(ch)) bytes.push(map.get(ch));
+      else { ok = false; break; }
+    }
+    if (!ok) continue;
+    try {
+      const fixed = new TextDecoder('utf-8', { fatal: true }).decode(new Uint8Array(bytes));
+      if (fixed !== str) return fixed;
+    } catch { /* not valid UTF-8 after reversal, so not mojibake from this charset */ }
+  }
+  return str;
+}
+
 // --- DynamoDB state (replaces the Worker's KV namespace) ---
 // Everything lives in one item so a read/write is a single request instead
 // of four. loadState() always returns all four fields (null if unset, same
@@ -371,7 +403,7 @@ async function runBot({ dryRun = false, invocationId = 'manual' } = {}) {
   } else {
     const nowHtml = await nowRes.text();
     const $ = cheerio.load(nowHtml);
-    title = $('h1').first().text().trim();
+    title = fixMojibake($('h1').first().text().trim());
     const filmHrefRaw = $('a[href*="/films/"]').first().attr('href') || null;
     filmHref = filmHrefRaw ? new URL(filmHrefRaw, 'https://www.criterionchannel.com').toString() : null;
 
@@ -517,7 +549,7 @@ async function runBot({ dryRun = false, invocationId = 'manual' } = {}) {
   const baseCost = [...basePost].length;
   const filmInfoBudget = Math.max(0, BSKY_LIMIT - baseCost - 1);
 
-  const filmInfoTrimmed = truncateFilmInfo(filmInfo, filmInfoBudget);
+  const filmInfoTrimmed = truncateFilmInfo(fixMojibake(filmInfo), filmInfoBudget);
   const postText = filmInfoTrimmed
     ? `🎬 Now streaming on Criterion Channel 24/7:\n\n${titleLine}\n${filmInfoTrimmed}\n\nNext film starts around: ${nextText}\n\n${linkText}`
     : basePost;
