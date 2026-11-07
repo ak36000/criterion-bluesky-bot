@@ -739,6 +739,141 @@ function jsonResponse(statusCode, obj) {
   };
 }
 
+// --- Criterion 24/7 programming schedule (JW Player media feed) ---
+// The 24/7 player page loads this JSON client-side. Its `schedule` array has
+// exact UTC start/end times for roughly the next week of programming. Each
+// entry's `mediaid` is also the film page id (/films/{mediaid} redirects to
+// the full /films/{mediaid}/{slug} URL).
+const SCHEDULE_URL = 'https://www.criterionchannel.com/api/media/1emmgvqX';
+
+// Criterion's schedule is cut into daily blocks at 11:00 UTC, so a film that
+// spans that boundary appears as two back-to-back entries with the same
+// mediaid. Join those back into one entry.
+function mergeSplitEntries(entries) {
+  const out = [];
+  for (const e of entries) {
+    const prev = out[out.length - 1];
+    if (prev && prev.mediaid === e.mediaid && prev.endTime === e.startTime) {
+      prev.endTime = e.endTime;
+      prev.mergedParts = (prev.mergedParts ?? 1) + 1;
+    } else {
+      out.push({
+        mediaid: e.mediaid,
+        title: e.title ?? e.episodeTitle ?? '',
+        startTime: e.startTime,
+        endTime: e.endTime,
+        programType: e.programType ?? null,
+        contentType: e.contentType ?? null,
+      });
+    }
+  }
+  return out;
+}
+
+// Given merged entries, return the one playing at `nowMs` and the one after.
+function findNowAndNext(entries, nowMs) {
+  const i = entries.findIndex(
+    (e) => Date.parse(e.startTime) <= nowMs && nowMs < Date.parse(e.endTime),
+  );
+  if (i === -1) {
+    const upcoming = entries.find((e) => Date.parse(e.startTime) > nowMs) ?? null;
+    return { current: null, next: upcoming };
+  }
+  return { current: entries[i], next: entries[i + 1] ?? null };
+}
+
+// ?probe=schedule — read-only check that this Lambda can reach the schedule
+// feed. Tries a few request variants one after another so we learn which
+// headers/params are actually needed. Never touches DynamoDB or Bluesky.
+async function probeSchedule() {
+  const variants = [
+    { name: 'browser headers, ?fresh=1', url: `${SCHEDULE_URL}?fresh=1`, headers: BROWSER_HEADERS },
+    { name: 'browser headers, no param', url: SCHEDULE_URL, headers: BROWSER_HEADERS },
+    { name: 'browser headers, JSON accept', url: SCHEDULE_URL, headers: { ...BROWSER_HEADERS, Accept: 'application/json' } },
+    { name: 'plain fetch, no headers', url: SCHEDULE_URL, headers: {} },
+  ];
+
+  const results = [];
+  let summary = null;
+
+  for (const v of variants) {
+    const started = Date.now();
+    const r = { variant: v.name, url: v.url };
+    try {
+      const res = await fetch(v.url, { headers: v.headers, signal: AbortSignal.timeout(15_000) });
+      const body = await res.text();
+      r.status = res.status;
+      r.ms = Date.now() - started;
+      r.bytes = body.length;
+      r.contentType = res.headers.get('content-type');
+      r.cacheControl = res.headers.get('cache-control');
+      r.age = res.headers.get('age');
+      r.server = res.headers.get('server');
+      r.cfRay = res.headers.get('cf-ray');
+      try {
+        const json = JSON.parse(body);
+        const raw = Array.isArray(json.schedule) ? json.schedule : [];
+        r.scheduleEntries = raw.length;
+        if (raw.length) {
+          r.scheduleFrom = raw[0].startTime;
+          r.scheduleTo = raw[raw.length - 1].endTime;
+        }
+        if (!summary && raw.length) {
+          const merged = mergeSplitEntries(raw);
+          const now = Date.now();
+          const { current, next } = findNowAndNext(merged, now);
+          summary = {
+            checkedAt: new Date(now).toISOString(),
+            rawEntries: raw.length,
+            mergedEntries: merged.length,
+            splitsMerged: raw.length - merged.length,
+            programTypes: [...new Set(raw.map((e) => `${e.programType}/${e.contentType}`))],
+            current,
+            next,
+            secondsUntilNext: next ? Math.round((Date.parse(next.startTime) - now) / 1000) : null,
+            nextFilmPage: next ? `https://www.criterionchannel.com/films/${next.mediaid}` : null,
+          };
+        }
+      } catch {
+        r.notJson = true;
+        r.bodyStart = body.slice(0, 300);
+      }
+    } catch (e) {
+      r.error = e.message;
+      r.ms = Date.now() - started;
+    }
+    results.push(r);
+    await new Promise((res) => setTimeout(res, 500)); // don't burst
+  }
+
+  // Baseline: the page the bot already scrapes, fetched the same way.
+  let whatsonnow = null;
+  try {
+    const started = Date.now();
+    const res = await fetch('https://whatsonnow.criterionchannel.com/', {
+      headers: BROWSER_HEADERS,
+      signal: AbortSignal.timeout(15_000),
+    });
+    const html = await res.text();
+    whatsonnow = {
+      status: res.status,
+      ms: Date.now() - started,
+      finalUrl: res.url,
+      h1: cheerio.load(html)('h1').first().text().trim() || null,
+    };
+  } catch (e) {
+    whatsonnow = { error: e.message };
+  }
+
+  return {
+    region: process.env.AWS_REGION ?? null,
+    ok: results.some((r) => r.status === 200 && r.scheduleEntries > 0),
+    summary,
+    variants: results,
+    whatsonnowBaseline: whatsonnow,
+  };
+}
+
 // Single entry point for both trigger types:
 //   - EventBridge Scheduler invocations have no requestContext/rawQueryString.
 //   - Function URL invocations carry the API Gateway v2 HTTP payload shape,
@@ -765,6 +900,14 @@ export const handler = async (event) => {
       }
     }
 
+    if (params.get('probe') === 'schedule') {
+      try {
+        return jsonResponse(200, await probeSchedule());
+      } catch (e) {
+        return jsonResponse(500, { error: e.message });
+      }
+    }
+
     if (params.get('dryRun') === 'true') {
       const result = await runBot({ dryRun: true, invocationId });
       if (!result) {
@@ -776,7 +919,7 @@ export const handler = async (event) => {
     return {
       statusCode: 200,
       headers: { 'content-type': 'text/plain' },
-      body: 'Criterion Bluesky Bot. Add ?dryRun=true to preview without posting.',
+      body: 'Criterion Bluesky Bot. Add ?dryRun=true to preview without posting, or ?probe=schedule to test access to the 24/7 schedule feed.',
     };
   }
 
