@@ -258,6 +258,20 @@ function extractPositionally($doc) {
   return { runtimeMinutes, filmInfo, releaseYear };
 }
 
+// Films scheduled to leave the Channel show a line like "Leaving November
+// 30th" right above the director, next to the <h1> title. Films that aren't
+// leaving have no such line. Matched by text, not class name, because the
+// page's class names look auto-generated (e.g. "epcjfa_firstLine").
+function extractLeavingText($doc) {
+  const $h1 = $doc('h1').first();
+  if (!$h1.length) return null;
+  for (const el of $h1.siblings().toArray()) {
+    const text = $doc(el).text().replace(/\s+/g, ' ').trim();
+    if (/^Leaving\b/i.test(text) && text.length <= 40) return text;
+  }
+  return null;
+}
+
 // Scrape a dedicated film page (https://www.criterionchannel.com/films/...)
 // for the director, poster image, runtime, and cast list.
 async function scrapeFilmPage(url) {
@@ -267,6 +281,7 @@ async function scrapeFilmPage(url) {
   const $film = cheerio.load(html);
 
   const imageUrl = $film('meta[property="og:image"]').attr('content') ?? null;
+  const leavingText = extractLeavingText($film);
 
   const { director, cast, runtimeMinutes: jsonLdRuntime, releaseYear: jsonLdYear } = extractFromJsonLd($film);
   let runtimeMinutes = jsonLdRuntime;
@@ -280,7 +295,7 @@ async function scrapeFilmPage(url) {
     if (!releaseYear) releaseYear = fallback.releaseYear;
   }
 
-  return { imageUrl, runtimeMinutes, filmInfo, releaseYear };
+  return { imageUrl, runtimeMinutes, filmInfo, releaseYear, leavingText };
 }
 
 // Repairs text whose UTF-8 bytes were mis-decoded as a single-byte charset
@@ -609,7 +624,7 @@ function formatNextStart(nextStartMs, fromMs) {
 async function getFilmDetails(filmHref, console) {
   if (!filmHref || isGenericLink(filmHref)) {
     console.log('No dedicated film page; posting without extra metadata.');
-    return { imageUrl: null, filmInfo: '', runtimeMinutes: null, releaseYear: null };
+    return { imageUrl: null, filmInfo: '', runtimeMinutes: null, releaseYear: null, leavingText: null };
   }
   try {
     const d = await scrapeFilmPage(filmHref);
@@ -618,16 +633,19 @@ async function getFilmDetails(filmHref, console) {
     console.log(`Runtime: ${d.runtimeMinutes ?? 'unknown'} min`);
     console.log(`Release year: ${d.releaseYear ?? 'unknown'}`);
     console.log(`Film info: ${d.filmInfo}`);
+	console.log(`Leaving: ${d.leavingText ?? 'no'}`);
     return d;
   } catch (e) {
     console.warn('Could not fetch/parse film page:', e.message);
-    return { imageUrl: null, filmInfo: '', runtimeMinutes: null, releaseYear: null };
+    return { imageUrl: null, filmInfo: '', runtimeMinutes: null, releaseYear: null, leavingText: null };
   }
 }
 
+const LEAVING_EMOJI = '⏳';
+
 // Build the post text + link facet. `nextLine` is the full "Next film starts
 // ..." line.
-function buildPost({ title, releaseYear, filmInfo, nextLine, filmLink }) {
+function buildPost({ title, releaseYear, filmInfo, nextLine, filmLink, leavingText }) {
   const linkText = 'Watch on Criterion Channel';
   const BSKY_LIMIT = 300;
 
@@ -640,11 +658,12 @@ function buildPost({ title, releaseYear, filmInfo, nextLine, filmLink }) {
   }
 
   const titleLine = releaseYear ? `${title} (${releaseYear})` : title;
-  const basePost = `🎬 Now streaming on Criterion Channel 24/7:\n\n${titleLine}\n\n${nextLine}\n\n${linkText}`;
+  const leavingBlock = leavingText ? `${LEAVING_EMOJI} ${leavingText}\n\n` : '';
+  const basePost = `🎬 Now streaming on Criterion Channel 24/7:\n\n${titleLine}\n\n${leavingBlock}${nextLine}\n\n${linkText}`;
   const filmInfoBudget = Math.max(0, BSKY_LIMIT - [...basePost].length - 1);
   const filmInfoTrimmed = truncateFilmInfo(fixMojibake(filmInfo), filmInfoBudget);
   const postText = filmInfoTrimmed
-    ? `🎬 Now streaming on Criterion Channel 24/7:\n\n${titleLine}\n${filmInfoTrimmed}\n\n${nextLine}\n\n${linkText}`
+    ? `🎬 Now streaming on Criterion Channel 24/7:\n\n${titleLine}\n${filmInfoTrimmed}\n\n${leavingBlock}${nextLine}\n\n${linkText}`
     : basePost;
 
   const encoder = new TextEncoder();
@@ -896,7 +915,7 @@ async function runScheduleMode({ entries, state, now, dryRun, console }) {
     const details = await getFilmDetails(filmLink, console);
     const nextLine = `Next film starts in: ${formatNextStart(nextStartMs, now)}`;
     const { postText, facets } = buildPost({
-      title: due.title, releaseYear: details.releaseYear, filmInfo: details.filmInfo, nextLine, filmLink,
+      title: due.title, releaseYear: details.releaseYear, filmInfo: details.filmInfo, nextLine, filmLink, leavingText: details.leavingText, 
     });
     const rkey = scheduleRkey(due);
     const secondsEarly = Math.round((Date.parse(due.startTime) - now) / 1000);
@@ -966,7 +985,7 @@ async function runScheduleMode({ entries, state, now, dryRun, console }) {
       const filmLink = filmPageFor(show);
       const details = await getFilmDetails(filmLink, console);
       const { postText, facets } = buildPost({
-        title: show.title, releaseYear: details.releaseYear, filmInfo: details.filmInfo, filmLink,
+        title: show.title, releaseYear: details.releaseYear, filmInfo: details.filmInfo, filmLink, leavingText: details.leavingText, 
         nextLine: `Next film starts in: ${formatNextStart(Date.parse(after?.startTime ?? show.endTime), now)}`,
       });
       preview = { title: show.title, scheduledStart: show.startTime, filmLink, imageUrl: details.imageUrl, releaseYear: details.releaseYear, filmInfo: details.filmInfo, postText, facets, rkey: scheduleRkey(show), note: 'Preview only: this showing is not due to be posted right now.' };
@@ -1023,7 +1042,7 @@ async function verifyNowPlaying({ entries, state, verifyKey, verifyAttempts, now
     ? `Next film starts around: ${formatNextStart(now + details.runtimeMinutes * 60 * 1000, now)}`
     : 'Next film starts around: unknown';
   const filmLink = filmHref && !isGenericLink(filmHref) ? filmHref : GENERIC_LINK;
-  const { postText, facets } = buildPost({ title, releaseYear: details.releaseYear, filmInfo: details.filmInfo, nextLine, filmLink });
+  const { postText, facets } = buildPost({ title, releaseYear: details.releaseYear, filmInfo: details.filmInfo, nextLine, filmLink, leavingText: details.leavingText, });
   const rkey = dedupeRkey(title, now);
   if (!dryRun) {
     await publishPost({ title, postText, facets, imageUrl: details.imageUrl, rkey, console });
@@ -1041,9 +1060,9 @@ async function runFallbackMode({ state, now, dryRun, console }) {
   const { title, filmHref } = await scrapeNowPlaying(console);
   const titleChanged = Boolean(title) && title !== lastTitle;
 
-  let details = { imageUrl: null, filmInfo: '', runtimeMinutes: null, releaseYear: null };
+  let details = { imageUrl: null, filmInfo: '', runtimeMinutes: null, releaseYear: null, leavingText: null };
   if (titleChanged || dryRun) details = await getFilmDetails(filmHref, console);
-  const { imageUrl, filmInfo, runtimeMinutes, releaseYear } = details;
+  const { imageUrl, filmInfo, runtimeMinutes, releaseYear, leavingText } = details;
   const filmLink = filmHref && !isGenericLink(filmHref) ? filmHref : GENERIC_LINK;
 
   // --- Determine next check time, poll mode, and wake-up margin ---
@@ -1118,7 +1137,7 @@ async function runFallbackMode({ state, now, dryRun, console }) {
   const nextLine = runtimeMinutes !== null
     ? `Next film starts around: ${formatNextStart(now + runtimeMinutes * 60 * 1000, now)}`
     : 'Next film starts around: unknown';
-  const { postText, facets } = buildPost({ title, releaseYear, filmInfo, nextLine, filmLink });
+  const { postText, facets } = buildPost({ title, releaseYear, filmInfo, nextLine, filmLink, leavingText: details.leavingText });
   const rkey = dedupeRkey(title, now);
   console.log('RKEY', rkey);
 
