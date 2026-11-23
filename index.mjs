@@ -349,10 +349,25 @@ async function loadState() {
     verifyAt: item.verifyAt ?? null,
     verifyAttempts: item.verifyAttempts ?? 0,
     scheduleRetryAt: item.scheduleRetryAt ?? null, // set while the schedule feed is unavailable
+    // Monthly recap (see runMonthlyTasks):
+    followerSnapshotDate: item.followerSnapshotDate ?? null, // Central date of the last follower snapshot
+    lastRecapMonth: item.lastRecapMonth ?? null,             // YYYY-MM of the last month recapped
   };
 }
 
 async function saveState(fields) {
+  return saveItem(STATE_PK, fields);
+}
+
+// Other items in the same table (follower snapshots). Written with
+// UpdateItem rather than PutItem so the Lambda's existing IAM permissions
+// (GetItem/UpdateItem on this table) are enough.
+async function loadItem(pk) {
+  const res = await ddb.send(new GetCommand({ TableName: TABLE_NAME, Key: { pk } }));
+  return res.Item ?? null;
+}
+
+async function saveItem(pk, fields) {
   const names = {};
   const values = {};
   const sets = [];
@@ -367,7 +382,7 @@ async function saveState(fields) {
   }
   await ddb.send(new UpdateCommand({
     TableName: TABLE_NAME,
-    Key: { pk: STATE_PK },
+    Key: { pk },
     UpdateExpression: `SET ${sets.join(', ')}`,
     ExpressionAttributeNames: names,
     ExpressionAttributeValues: values,
@@ -832,6 +847,340 @@ async function scrapeNowPlaying(console) {
   return { title, filmHref };
 }
 
+// =====================================================================
+// Monthly recap
+// =====================================================================
+// Once a month the bot posts a recap of the previous calendar month
+// (Central time): films announced, new followers, and a quote-embed of the
+// month's most popular film post. Supporting this, it snapshots the
+// account's follower count once a day, since Bluesky keeps no history of it.
+//
+// Both jobs run only on ticks the film logic would otherwise skip, so they
+// never share an invocation (or its time budget) with a film post, and any
+// failure is logged and retried on a later tick without touching film posts.
+
+const RECAP_TZ = 'America/Chicago';
+// Months before this are never recapped (avoids an instant recap of an old
+// month the first time this code is deployed).
+const RECAP_FIRST_MONTH = '2026-11';
+// Post the recap on this day of the following month, at or after this
+// Central hour, so late-month posts have had a few days to collect
+// engagement.
+const RECAP_DAY = 3;
+const RECAP_HOUR = 10;
+
+// Popularity score for a post. Reposts and quotes spread a post to new
+// timelines, so they count double; replies on a bot can be corrections as
+// often as praise, so they count the same as a like.
+const SCORE_WEIGHTS = { like: 1, repost: 2, quote: 2, reply: 1 };
+
+// Closing question, one per calendar month being recapped (January first).
+const RECAP_QUESTIONS = [
+  'What was the best thing you caught on the stream this month?',
+  "Which film from this month's lineup stuck with you?",
+  'Did the stream introduce you to anything new this month?',
+  'What did you tune into mid-film and end up staying for?',
+  'Which film from this month would you recommend to a friend?',
+  'Any first-time watches this month? Tell us about them.',
+  "What's one film from this month you'd happily watch again?",
+  'What surprised you most on the stream this month?',
+  'Did you catch an old favorite this month? Which one?',
+  'If you could program one evening of the stream, what would you show?',
+  'Which film this month had the best opening scene?',
+  'What should someone new to the Criterion Channel start with?',
+];
+
+const PUBLIC_API = 'https://public.api.bsky.app/xrpc';
+const PDS = 'https://bsky.social/xrpc';
+
+// --- Central-time calendar helpers ---
+const tzParts = new Intl.DateTimeFormat('en-US', {
+  timeZone: RECAP_TZ, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', hourCycle: 'h23',
+});
+
+function centralParts(ms) {
+  const p = Object.fromEntries(tzParts.formatToParts(new Date(ms)).map((x) => [x.type, x.value]));
+  return { year: +p.year, month: +p.month, day: +p.day, hour: +p.hour };
+}
+
+const pad2 = (n) => String(n).padStart(2, '0');
+const monthKey = (y, m) => `${y}-${pad2(m)}`;
+const dateKey = (y, m, d) => `${y}-${pad2(m)}-${pad2(d)}`;
+
+// UTC instant of midnight Central on the given date. Month overflow is
+// allowed (month 13 = January of the next year).
+function centralMidnightUtc(year, month, day) {
+  const norm = new Date(Date.UTC(year, month - 1, day));
+  const y = norm.getUTCFullYear(); const m = norm.getUTCMonth() + 1; const d = norm.getUTCDate();
+  for (const offsetHours of [5, 6]) { // CDT, CST
+    const t = Date.UTC(y, m - 1, d, offsetHours);
+    const p = centralParts(t);
+    if (p.year === y && p.month === m && p.day === d && p.hour === 0) return t;
+  }
+  throw new Error(`Could not find Central midnight for ${dateKey(y, m, d)}`);
+}
+
+// "2026-11" -> bounds and labels for that Central-time month.
+function monthInfo(key) {
+  const [year, month] = key.split('-').map(Number);
+  const next = new Date(Date.UTC(year, month, 1));
+  const nextYear = next.getUTCFullYear(); const nextMonth = next.getUTCMonth() + 1;
+  return {
+    key,
+    year,
+    month,
+    name: new Date(Date.UTC(year, month - 1, 15)).toLocaleString('en-US', { month: 'long', timeZone: 'UTC' }),
+    startMs: centralMidnightUtc(year, month, 1),
+    endMs: centralMidnightUtc(nextYear, nextMonth, 1),
+    firstDayKey: dateKey(year, month, 1),
+    nextFirstDayKey: dateKey(nextYear, nextMonth, 1),
+  };
+}
+
+function previousMonthKey(ms) {
+  const { year, month } = centralParts(ms);
+  return month === 1 ? monthKey(year - 1, 12) : monthKey(year, month - 1);
+}
+
+// Decode a TID record key (base32-sortable, 53 bits of microseconds + 10
+// bits of clock id) to milliseconds. Returns null if it isn't a TID.
+function tidToMs(tid) {
+  if (!/^[2-7a-z]{13}$/.test(tid)) return null;
+  let v = 0n;
+  for (const c of tid) v = (v << 5n) | BigInt(B32.indexOf(c));
+  return Number((v >> 10n) / 1000n);
+}
+
+// --- Bluesky helpers ---
+async function bskyGet(base, method, params, accessJwt) {
+  const url = `${base}/${method}?${new URLSearchParams(params)}`;
+  const res = await fetch(url, {
+    headers: accessJwt ? { Authorization: `Bearer ${accessJwt}` } : {},
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (!res.ok) throw new Error(`${method} failed: HTTP ${res.status} ${await res.text()}`);
+  return res.json();
+}
+
+async function bskyLogin() {
+  const res = await fetch(`${PDS}/com.atproto.server.createSession`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ identifier: process.env.BSKY_HANDLE, password: process.env.BSKY_APP_PASSWORD }),
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!res.ok) throw new Error(`Login failed: ${res.status} ${await res.text()}`);
+  return res.json(); // { accessJwt, did, ... }
+}
+
+async function getFollowersCount() {
+  const profile = await bskyGet(PUBLIC_API, 'app.bsky.actor.getProfile', { actor: process.env.BSKY_HANDLE });
+  return profile.followersCount;
+}
+
+// A film alert is any post linking to criterionchannel.com. This keeps
+// recaps (and anything else posted by hand) out of the film count.
+function isFilmPost(record) {
+  return (record?.facets ?? []).some((f) => (f.features ?? []).some(
+    (x) => x.$type === 'app.bsky.richtext.facet#link' && /criterionchannel\.com/.test(x.uri ?? ''),
+  ));
+}
+
+function scorePost(post) {
+  return (post.likeCount ?? 0) * SCORE_WEIGHTS.like
+    + (post.repostCount ?? 0) * SCORE_WEIGHTS.repost
+    + (post.quoteCount ?? 0) * SCORE_WEIGHTS.quote
+    + (post.replyCount ?? 0) * SCORE_WEIGHTS.reply;
+}
+
+// Every film post the bot made during the month, with current engagement.
+async function collectMonthPosts(info, console) {
+  const posts = [];
+  let cursor;
+  let pages = 0;
+  // The feed is newest-first. Stop a day past the month start, to allow for
+  // small differences between createdAt and the feed's ordering.
+  const stopBefore = info.startMs - 24 * 3600 * 1000;
+  while (pages < 100) {
+    const params = { actor: process.env.BSKY_HANDLE, filter: 'posts_no_replies', limit: '100' };
+    if (cursor) params.cursor = cursor;
+    const page = await bskyGet(PUBLIC_API, 'app.bsky.feed.getAuthorFeed', params);
+    pages += 1;
+    let oldest = Infinity;
+    for (const item of page.feed ?? []) {
+      if (item.reason) continue; // a repost, not our own post
+      const created = Date.parse(item.post.record?.createdAt);
+      if (Number.isFinite(created)) oldest = Math.min(oldest, created);
+      if (created >= info.startMs && created < info.endMs && isFilmPost(item.post.record)) {
+        posts.push(item.post);
+      }
+    }
+    cursor = page.cursor;
+    if (!cursor || oldest < stopBefore) break;
+  }
+  console.log(`Recap ${info.key}: read ${pages} feed page(s), ${posts.length} film post(s).`);
+  return posts;
+}
+
+// One-time estimate for months without daily snapshots: current followers
+// whose follow record (a TID, so it encodes when it was created) falls in
+// the month. Misses anyone who followed and later unfollowed, so it counts
+// "followed this month and still following", not net change.
+async function backfillNewFollowers(info, console) {
+  const { accessJwt, did } = await bskyLogin();
+  let cursor;
+  let count = 0;
+  let scanned = 0;
+  let pages = 0;
+  let noTimestamp = 0;
+  while (pages < 200) {
+    const params = { actor: did, limit: '100' };
+    if (cursor) params.cursor = cursor;
+    const page = await bskyGet(PDS, 'app.bsky.graph.getFollowers', params, accessJwt);
+    pages += 1;
+    let newestOnPage = -Infinity;
+    for (const f of page.followers ?? []) {
+      scanned += 1;
+      const rkey = (f.viewer?.followedBy ?? '').split('/').pop();
+      const followedAt = tidToMs(rkey);
+      if (followedAt === null) { noTimestamp += 1; continue; }
+      newestOnPage = Math.max(newestOnPage, followedAt);
+      if (followedAt >= info.startMs && followedAt < info.endMs) count += 1;
+    }
+    cursor = page.cursor;
+    // Followers come newest-first; once a whole page predates the month,
+    // nothing further back can be in it.
+    if (!cursor || (newestOnPage !== -Infinity && newestOnPage < info.startMs)) break;
+  }
+  console.log(`Follower backfill ${info.key}: ${count} new of ${scanned} scanned (${pages} pages, ${noTimestamp} without a readable timestamp).`);
+  return { count, scanned, pages, noTimestamp };
+}
+
+// New followers for the month: net change between the snapshots taken on
+// the 1st of the month and the 1st of the next, or the backfill estimate if
+// either snapshot is missing.
+async function newFollowersForMonth(info, console) {
+  const [start, end] = await Promise.all([
+    loadItem(`followers#${info.firstDayKey}`),
+    loadItem(`followers#${info.nextFirstDayKey}`),
+  ]);
+  if (start && end) {
+    return { count: end.count - start.count, source: 'snapshots', start: start.count, end: end.count };
+  }
+  const backfill = await backfillNewFollowers(info, console);
+  return { count: backfill.count, source: 'backfill', ...backfill };
+}
+
+function buildRecapText({ info, filmCount, newFollowers, hasTopPost }) {
+  const lines = [`📅 ${info.name} on the Criterion Channel 24/7 Bot`, ''];
+  lines.push(`🎞️ ${filmCount.toLocaleString('en-US')} films announced`);
+  if (newFollowers > 0) {
+    lines.push(newFollowers === 1
+      ? '👋 Welcome to our 1 new follower!'
+      : `👋 Welcome to our ${newFollowers.toLocaleString('en-US')} new followers!`);
+  }
+  lines.push('', RECAP_QUESTIONS[info.month - 1]);
+  if (hasTopPost) lines.push('', 'Your favorite post of the month 👇');
+  return lines.join('\n');
+}
+
+// Gather everything for a month's recap. Read-only: posts nothing, saves
+// nothing.
+async function buildRecap(key, console) {
+  const info = monthInfo(key);
+  const posts = await collectMonthPosts(info, console);
+  const ranked = posts
+    .map((p) => ({ post: p, score: scorePost(p) }))
+    .sort((a, b) => b.score - a.score
+      || (b.post.likeCount ?? 0) - (a.post.likeCount ?? 0)
+      || Date.parse(a.post.record.createdAt) - Date.parse(b.post.record.createdAt));
+  const top = ranked[0]?.score > 0 ? ranked[0].post : null;
+  const followers = await newFollowersForMonth(info, console);
+  const text = buildRecapText({ info, filmCount: posts.length, newFollowers: followers.count, hasTopPost: Boolean(top) });
+  return {
+    month: key,
+    range: { start: new Date(info.startMs).toISOString(), end: new Date(info.endMs).toISOString() },
+    filmCount: posts.length,
+    followers,
+    text,
+    graphemes: [...new Intl.Segmenter().segment(text)].length,
+    topPost: top ? { uri: top.uri, cid: top.cid } : null,
+    leaderboard: ranked.slice(0, 5).map(({ post, score }) => ({
+      score,
+      likes: post.likeCount ?? 0,
+      reposts: post.repostCount ?? 0,
+      quotes: post.quoteCount ?? 0,
+      replies: post.replyCount ?? 0,
+      firstLine: (post.record.text ?? '').split('\n').find((l) => l && !l.startsWith('🎬')) ?? '',
+      createdAt: post.record.createdAt,
+      uri: post.uri,
+    })),
+  };
+}
+
+async function publishRecap(recap, console) {
+  const info = monthInfo(recap.month);
+  const { accessJwt, did } = await bskyLogin();
+  // Deterministic key one microsecond after the month's start: unique per
+  // month (film keys sit on 30-minute boundaries), so a retried or
+  // concurrent attempt can't post the recap twice.
+  const rkey = makeTid(info.startMs * 1000 + 1, hash10('monthly-recap'));
+  const record = {
+    $type: 'app.bsky.feed.post',
+    text: recap.text,
+    createdAt: new Date().toISOString(),
+  };
+  if (recap.topPost) {
+    record.embed = { $type: 'app.bsky.embed.record', record: recap.topPost };
+  }
+  const res = await fetch(`${PDS}/com.atproto.repo.createRecord`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${accessJwt}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ repo: did, collection: 'app.bsky.feed.post', rkey, record }),
+    signal: AbortSignal.timeout(30_000),
+  });
+  const body = await res.text();
+  if (!res.ok) {
+    const check = await fetch(
+      `${PDS}/com.atproto.repo.getRecord?repo=${encodeURIComponent(did)}&collection=app.bsky.feed.post&rkey=${rkey}`,
+      { signal: AbortSignal.timeout(15_000) },
+    );
+    if (check.ok) {
+      console.log(`Recap ${recap.month} already posted (rkey ${rkey}).`);
+      return 'deduped';
+    }
+    throw new Error(`Recap post failed: ${res.status} ${body}`);
+  }
+  console.log('RECAP_POSTED', body);
+  return 'posted';
+}
+
+// Called on ticks the film logic skips. Does at most one job per tick.
+async function runMonthlyTasks({ state, now, console }) {
+  const today = centralParts(now);
+  const todayKey = dateKey(today.year, today.month, today.day);
+
+  // 1. Daily follower snapshot, taken on the first quiet tick after midnight.
+  if (state.followerSnapshotDate !== todayKey) {
+    const count = await getFollowersCount();
+    await saveItem(`followers#${todayKey}`, { count, takenAt: new Date(now).toISOString() });
+    await saveState({ followerSnapshotDate: todayKey });
+    console.log(`FOLLOWER_SNAPSHOT ${todayKey}: ${count}`);
+    return;
+  }
+
+  // 2. Monthly recap of the previous month.
+  const recapKey = previousMonthKey(now);
+  if (state.lastRecapMonth === recapKey || recapKey < RECAP_FIRST_MONTH) return;
+  if (today.day < RECAP_DAY || (today.day === RECAP_DAY && today.hour < RECAP_HOUR)) return;
+
+  const recap = await buildRecap(recapKey, console);
+  console.log('RECAP_BUILT', JSON.stringify(recap));
+  if (recap.filmCount > 0) await publishRecap(recap, console);
+  else console.warn(`No film posts found for ${recapKey}; skipping the recap post.`);
+  await saveState({ lastRecapMonth: recapKey });
+}
+
 async function runBot({ dryRun = false, invocationId = 'manual' } = {}) {
   // Shadow console so every log line (including inside helpers) is tagged
   // with this invocation's id.
@@ -849,6 +1198,13 @@ async function runBot({ dryRun = false, invocationId = 'manual' } = {}) {
   // --- Respect the scheduled wait (skip this gate during a dry run) ---
   if (nextCheckAt && now < nextCheckAt && !dryRun) {
     console.log(`Skipping — next check scheduled for ${new Date(nextCheckAt).toISOString()}`);
+    // Quiet tick: use it for the follower snapshot / monthly recap. A
+    // failure here is retried on a later tick and never affects film posts.
+    try {
+      await runMonthlyTasks({ state, now, console });
+    } catch (e) {
+      console.warn(`Monthly task failed (will retry on a later tick): ${e.message}`);
+    }
     return;
   }
   if (nextCheckAt && now < nextCheckAt && dryRun) {
@@ -1213,6 +1569,22 @@ export const handler = async (event) => {
       }
     }
 
+    // ?recap=preview[&month=YYYY-MM] — build a month's recap (default: last
+    // month) and return it without posting or saving anything.
+    if (flag('recap') === 'preview') {
+      try {
+        const month = params.get('month') ?? previousMonthKey(Date.now());
+        if (!/^\d{4}-\d{2}$/.test(month)) return jsonResponse(400, { error: 'month must look like 2026-11' });
+        const console = {
+          log: (...a) => globalThis.console.log(`[${invocationId}]`, ...a),
+          warn: (...a) => globalThis.console.warn(`[${invocationId}]`, ...a),
+        };
+        return jsonResponse(200, await buildRecap(month, console));
+      } catch (e) {
+        return jsonResponse(500, { error: e.message });
+      }
+    }
+
     if (flag('dryrun') === 'true') {
       const result = await runBot({ dryRun: true, invocationId });
       if (!result) {
@@ -1224,7 +1596,7 @@ export const handler = async (event) => {
     return {
       statusCode: 200,
       headers: { 'content-type': 'text/plain' },
-      body: 'Criterion Bluesky Bot. Add ?dryRun=true to preview without posting, or ?probe=schedule to test access to the 24/7 schedule feed.',
+      body: 'Criterion Bluesky Bot. Add ?dryRun=true to preview without posting, ?probe=schedule to test access to the 24/7 schedule feed, or ?recap=preview&month=YYYY-MM to preview a monthly recap.',
     };
   }
 

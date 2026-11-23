@@ -31,6 +31,29 @@ Runs on **AWS Lambda**, triggered once a minute by an EventBridge Scheduler rule
 
 Transient errors from Criterion's side (403, 429, 5xx) are retried once in-request and otherwise treated as "no change, try again on the normal schedule" rather than crashing or posting garbage.
 
+### Monthly recap
+
+On the 3rd of each month at 10 AM Central (or the first quiet tick after), the bot posts a recap of the previous calendar month, with months defined in Central time:
+
+```
+📅 November on the Criterion Channel 24/7 Bot
+
+🎞️ 363 films announced
+👋 Welcome to our 120 new followers!
+
+Which film this month had the best opening scene?
+
+Your favorite post of the month 👇
+[quote-embed of the month's most popular film post]
+```
+
+- **Films announced:** the bot's own posts in that month that link to criterionchannel.com, so recaps and hand-written posts aren't counted.
+- **Most popular post:** score = likes + 2×reposts + 2×quotes + replies (`SCORE_WEIGHTS`), ties broken by likes and then by the earlier post. Engagement totals are read on the 3rd so late-month posts have had a few days to catch up.
+- **New followers:** net change between the daily follower snapshots taken on the 1st of the month and the 1st of the next. If either snapshot is missing (e.g. November 2026, before snapshots existed), it falls back to a backfill estimate: current followers whose follow record was created during the month. That estimate leaves out people who followed and then unfollowed. The line is left out if the number is zero or negative.
+- **Closing question:** rotates by calendar month (`RECAP_QUESTIONS`, January first).
+
+The follower snapshot (once a day, just after midnight Central) and the recap run only on ticks the film logic would otherwise skip, so they never delay a film post, and a failure is logged and retried on a later tick. Snapshots are stored in the same DynamoDB table as items with keys like `followers#2026-11-25`; the state item gains `followerSnapshotDate` and `lastRecapMonth`. Months before `RECAP_FIRST_MONTH` (2026-11) are never recapped.
+
 ### Testing URLs (Function URL)
 
 Setting names and values are not case-sensitive.
@@ -38,6 +61,7 @@ Setting names and values are not case-sensitive.
 - `?dryRun=true` — shows what the bot would do right now (mode, the post it would make, and when it plans to wake next) without posting or saving state.
 - `?probe=schedule` — checks that the Lambda can read the schedule feed, and reports what's playing now and next.
 - `?filmpage=<url>` — scrapes one film page and shows the extracted metadata.
+- `?recap=preview&month=YYYY-MM` — builds that month's recap (default: last month) and shows the post text, follower numbers and their source, and the top five posts with their scores, without posting or saving anything.
 
 ### Title/metadata scraping notes
 
